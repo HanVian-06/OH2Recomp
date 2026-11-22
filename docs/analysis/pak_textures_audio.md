@@ -12,7 +12,7 @@
 - **Compression Breakdown**:
   - `Zlib` (`comp_method = 1`): **`17,271`** entries
   - Uncompressed (`comp_method = 0`): **`2,649`** entries
-  - Total Uncompressed Payload: **`4,247.69 MB`** (`4,454,019,836` bytes)
+  - Total Uncompressed Payload: **`4,247.69 MB`** (`4,454,021,592` bytes)
 
 ---
 
@@ -29,8 +29,8 @@
 | `.txt` | 25 | 1,903,462 | 7,605,545 |
 | `.ttf` | 13 | 2,793,443 | 5,803,364 |
 | `.bin` | 2 | 489,620 | 4,076,482 |
-| `.png` / `.res` / `.psd` / `.locres` / `.ini` / other | 843 | 2,520,577 | 4,945,224 |
-| **Total** | **19,920** | **2,407,657,332** (+ headers/index) | **4,454,019,836 (`4,247.69 MB`)** |
+| `.png` / `.res` / `.psd` / `.locres` / `.ini` / other | 843 | 2,247,305 | 5,016,980 |
+| **Total** | **19,920** | **2,407,384,060** (+ headers/index) | **4,454,021,592 (`4,247.69 MB`)** |
 
 ---
 

@@ -2,7 +2,7 @@
 
 **Reproducible Verification Script**: `python scripts/analysis/inspect_macho.py` (supports `--json`)  
 **Target Binary (Read-Only)**: `Payload/OH2.app/OH2` (`53,729,072` bytes)  
-**Engine**: Unreal Engine 4.23 (`++UE4+Release-4.23-CL-0`), Bundle ID `com.cornfox.oceanhorn2`, Version `100.76955.200521` (`0.78`)
+**Engine**: Unreal Engine 4.23 (`++UE4+Release-4.23 May 22 2020 +`), Bundle ID `com.cornfox.oceanhorn2`, Version `100.76955.200521` (`0.78`)
 
 ---
 
