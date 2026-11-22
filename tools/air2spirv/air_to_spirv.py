@@ -748,9 +748,35 @@ class SpirvBuilder:
                 self.arg_init_kind[arg_vid] = ("load_input", vid, b_ty)
 
             elif kind == "air.render_target":
-                # Framebuffer fetch input (gl_LastFragData): provide zero vector constant
+                # Framebuffer fetch input ([[color(N)]] / gl_LastFragData):
+                # Bind synthetic 2D texture at Metal texture slot 30 (Vulkan Set 1 Binding 62)
+                # and fetch at uvec2(gl_FragCoord.xy) via OpImageFetch.
                 spv_ty = self.map_ir_type_to_spv(arg_ir_ty)
-                self.arg_init_kind[arg_vid] = ("const", self.c_null(spv_ty))
+                fc_vid, fc_ty = get_builtin_input(BUILTIN_FRAG_COORD, self.t_vec(self.t_f32(), 4))
+                fb_slot = 30
+                sampled_ty = self.t_f32()
+                img_ty = self.t_image(sampled_ty, 1, 0, 0, 0)
+                pty = self.t_ptr(SC_UNIFORM_CONSTANT, img_ty)
+                tex_var_id = self.alloc_id()
+                self.type_const_globals.extend(encode_inst(OP_VARIABLE, [pty, tex_var_id, SC_UNIFORM_CONSTANT]))
+                self.emit_dec(tex_var_id, DEC_DESCRIPTOR_SET, [self.desc_set])
+                self.emit_dec(tex_var_id, DEC_BINDING, [32 + fb_slot])
+                self.texture_mask |= (1 << fb_slot)
+                self.entry_flags |= (1 << 5)  # SPIRV_ENTRY_FLAG_FB_FETCH
+                self.bindings_reflection.append(
+                    {
+                        "set": self.desc_set,
+                        "binding": 32 + fb_slot,
+                        "descriptor_type": 2,  # VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+                        "metal_slot": fb_slot,
+                        "metal_kind": 1,  # SPIRV_METAL_KIND_TEXTURE
+                        "image_dim": 2,  # SPIRV_IMAGE_DIM_2D
+                        "is_depth": 0,
+                        "flags": 1,
+                        "buffer_size_bytes": 0,
+                    }
+                )
+                self.arg_init_kind[arg_vid] = ("fb_fetch", fc_vid, fc_ty, tex_var_id, img_ty, spv_ty)
 
             elif kind == "air.vertex_id":
                 vid, b_ty = get_builtin_input(BUILTIN_VERTEX_INDEX, self.t_u32())
@@ -1115,6 +1141,36 @@ class SpirvBuilder:
                     ld_id = self.alloc_id()
                     entry_init_code.extend(encode_inst(OP_LOAD, [in_spv_ty, ld_id, in_var_id]))
                     global_ssa_map[vid] = ld_id
+                elif akind[0] == "fb_fetch":
+                    fc_vid, fc_ty, tex_var_id, img_ty, target_spv_ty = akind[1], akind[2], akind[3], akind[4], akind[5]
+                    fc_val = self.alloc_id()
+                    entry_init_code.extend(encode_inst(OP_LOAD, [fc_ty, fc_val, fc_vid]))
+                    v2f_ty = self.t_vec(self.t_f32(), 2)
+                    fc_xy = self.alloc_id()
+                    entry_init_code.extend(encode_inst(OP_VECTOR_SHUFFLE, [v2f_ty, fc_xy, fc_val, fc_val, 0, 1]))
+                    v2u_ty = self.t_vec(self.t_u32(), 2)
+                    coord_u2 = self.alloc_id()
+                    entry_init_code.extend(encode_inst(OP_CONVERT_F_TO_U, [v2u_ty, coord_u2, fc_xy]))
+                    img_val = self.alloc_id()
+                    entry_init_code.extend(encode_inst(OP_LOAD, [img_ty, img_val, tex_var_id]))
+                    v4f_ty = self.t_vec(self.t_f32(), 4)
+                    lod0 = self.c_u32(0)
+                    fetched_v4 = self.alloc_id()
+                    entry_init_code.extend(encode_inst(OP_IMAGE_FETCH, [v4f_ty, fetched_v4, img_val, coord_u2, 0x02, lod0]))
+                    if target_spv_ty == v4f_ty:
+                        global_ssa_map[vid] = fetched_v4
+                    else:
+                        ir_t = self.mod.types[ir_ty]
+                        if ir_t[0] == "vec":
+                            shuf_id = self.alloc_id()
+                            entry_init_code.extend(
+                                encode_inst(OP_VECTOR_SHUFFLE, [target_spv_ty, shuf_id, fetched_v4, fetched_v4] + list(range(ir_t[1])))
+                            )
+                            global_ssa_map[vid] = shuf_id
+                        else:
+                            ext_id = self.alloc_id()
+                            entry_init_code.extend(encode_inst(OP_COMPOSITE_EXTRACT, [target_spv_ty, ext_id, fetched_v4, 0]))
+                            global_ssa_map[vid] = ext_id
 
         # Initialize all reg2mem_vars in entry block so they are always initialized
         for vid, vinfo in reg2mem_vars.items():

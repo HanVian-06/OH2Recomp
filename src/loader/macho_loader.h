@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,6 +56,7 @@ typedef struct {
 typedef struct {
     char          path[512];
     int           fd;
+    off_t         base_file_offset;
     size_t        file_size;
     void         *base_addr;
     uint64_t      preferred_base;
@@ -122,6 +124,8 @@ typedef struct {
 
 /* Public M1 Loader API */
 int   macho_load(const char *path, MachOImage *out_img);
+int   macho_load_at_offset(const char *path, off_t base_file_offset, size_t image_size, MachOImage *out_img);
+int   macho_load_from_apk(const char *apk_path, const char *entry_name, MachOImage *out_img);
 void *macho_lookup_export(const MachOImage *img, const char *sym_name);
 int   macho_run_initializers(MachOImage *img, int argc, char **argv, char **envp, char **apple);
 int   macho_call_main(MachOImage *img, int argc, char **argv, char **envp, char **apple);
@@ -148,6 +152,8 @@ void        oh2_symbol_register_override(const char *sym_name, void *addr);
 void        oh2_objc_register_instance_method(const char *cls_name, const char *sel_name, void *imp);
 void        oh2_objc_register_class_method(const char *cls_name, const char *sel_name, void *imp);
 void       *oh2_objc_get_class(const char *cls_name);
+void       *oh2_objc_ensure_class(const char *cls_name, const char *super_name);
+const char *oh2_objc_object_class_name(const void *obj);
 void       *oh2_objc_alloc_instance(void *cls, size_t extra_bytes);
 void       *oh2_objc_create_string(const char *utf8);
 void       *oh2_objc_create_string_len(const char *utf8, size_t len);
@@ -155,8 +161,17 @@ const char *oh2_objc_intern_selector(const char *sel_name);
 void       *oh2_objc_lookup_imp(void *self, const char *sel);
 void       *oh2_objc_lookup_super2_imp(void *sup, const char *sel);
 int         oh2_objc_is_heap_object(const void *obj);
+int         oh2_objc_is_block(const void *obj);
+void       *oh2_objc_get_malloc_block_isa(void);
+void        oh2_objc_register_block_methods(void *copy_imp, void *retain_imp, void *release_imp,
+                                            void *global_retain_imp, void *global_release_imp);
 int32_t     oh2_objc_get_refcount(const void *obj);
 int32_t     oh2_objc_add_refcount(void *obj, int32_t delta);
+void        oh2_objc_set_dealloc(void *obj, void (*dealloc_fn)(void *obj));
+void        oh2_objc_mark_immortal(void *obj);
+void        oh2_objc_mark_reclaimable(void *obj);
+void        oh2_objc_release_object(void *obj);
+void        oh2_objc_register_autorelease_hook(void *(*hook)(void *obj));
 void        oh2_objc_set_bundle_root(const char *path);
 const char *oh2_objc_get_bundle_root(void);
 

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.oceanhorn2.port"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk
+        android:minSdkVersion="29"
+        android:targetSdkVersion="36" />
+
+    <uses-feature
+        android:name="android.hardware.vulkan.level"
+        android:version="1"
+        android:required="true" />
+    <uses-feature
+        android:name="android.hardware.vulkan.version"
+        android:version="0x401000"
+        android:required="true" />
+
+    <application
+        android:label="Oceanhorn 2"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:hasCode="false"
+        android:debuggable="true"
+        android:gwpAsanMode="never"
+        android:extractNativeLibs="false">
+
+        <activity
+            android:name="android.app.NativeActivity"
+            android:label="Oceanhorn 2"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|uiMode">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="oh2_android" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

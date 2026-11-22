@@ -197,11 +197,17 @@ static uint64_t read_uleb128(const uint8_t **pp, const uint8_t *end) {
     return result;
 }
 
-int macho_load(const char *path, MachOImage *out_img) {
+int macho_load_at_offset(const char *path, off_t base_file_offset, size_t image_size, MachOImage *out_img) {
     if (!path || !out_img) return -1;
+    if ((base_file_offset & 0x3FFFLL) != 0) {
+        oh2_log_error("macho_load_at_offset: offset 0x%llx is not 16 KiB aligned",
+                      (unsigned long long)base_file_offset);
+        return -1;
+    }
     memset(out_img, 0, sizeof(*out_img));
     snprintf(out_img->path, sizeof(out_img->path), "%s", path);
     out_img->fd = -1;
+    out_img->base_file_offset = base_file_offset;
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -211,18 +217,18 @@ int macho_load(const char *path, MachOImage *out_img) {
     out_img->fd = fd;
 
     struct stat st;
-    if (fstat(fd, &st) < 0 || (size_t)st.st_size < sizeof(mach_header_64_t)) {
+    if (fstat(fd, &st) < 0 || (uint64_t)st.st_size < (uint64_t)base_file_offset + sizeof(mach_header_64_t)) {
         oh2_log_error("Invalid file size for '%s'", path);
         close(fd);
         out_img->fd = -1;
         return -1;
     }
-    out_img->file_size = (size_t)st.st_size;
+    out_img->file_size = (image_size > 0) ? image_size : (size_t)((uint64_t)st.st_size - (uint64_t)base_file_offset);
 
     uint8_t header_buf[65536];
-    ssize_t nread = pread(fd, header_buf, sizeof(header_buf), 0);
+    ssize_t nread = pread(fd, header_buf, sizeof(header_buf), base_file_offset);
     if (nread < (ssize_t)sizeof(mach_header_64_t)) {
-        oh2_log_error("Failed reading mach_header_64");
+        oh2_log_error("Failed reading mach_header_64 at offset 0x%llx", (unsigned long long)base_file_offset);
         close(fd);
         out_img->fd = -1;
         return -1;
@@ -401,12 +407,13 @@ int macho_load(const char *path, MachOImage *out_img) {
                            prot,
                            MAP_PRIVATE | MAP_FIXED,
                            fd,
-                           (off_t)seg->fileoff);
+                           base_file_offset + (off_t)seg->fileoff);
             if (m == MAP_FAILED) {
-                oh2_log_error("Failed mapping segment %s at %p (filesize=0x%llx fileoff=0x%llx): %s",
+                oh2_log_error("Failed mapping segment %s at %p (filesize=0x%llx fileoff=0x%llx baseoff=0x%llx): %s",
                               seg->segname, seg_target,
                               (unsigned long long)seg->filesize,
                               (unsigned long long)seg->fileoff,
+                              (unsigned long long)base_file_offset,
                               strerror(errno));
                 return -1;
             }
@@ -493,6 +500,133 @@ int macho_load(const char *path, MachOImage *out_img) {
     }
 
     return 0;
+}
+
+static inline uint16_t zip_u16(const uint8_t *p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static inline uint32_t zip_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+int macho_load(const char *path, MachOImage *out_img) {
+    return macho_load_at_offset(path, 0, 0, out_img);
+}
+
+int macho_load_from_apk(const char *apk_path, const char *entry_name, MachOImage *out_img) {
+    if (!apk_path || !entry_name || !out_img) return -1;
+    int fd = open(apk_path, O_RDONLY);
+    if (fd < 0) {
+        oh2_log_error("macho_load_from_apk: open('%s') failed: %s", apk_path, strerror(errno));
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size < 22) {
+        close(fd);
+        return -1;
+    }
+
+    /* Search last 65 KiB for ZIP End of Central Directory (0x06054b50) */
+    size_t tail_sz = (st.st_size > 66000) ? 66000 : (size_t)st.st_size;
+    off_t tail_off = st.st_size - (off_t)tail_sz;
+    uint8_t *tail = (uint8_t *)malloc(tail_sz);
+    if (!tail) {
+        close(fd);
+        return -1;
+    }
+    if (pread(fd, tail, tail_sz, tail_off) != (ssize_t)tail_sz) {
+        free(tail);
+        close(fd);
+        return -1;
+    }
+
+    off_t eocd_pos = -1;
+    for (ssize_t i = (ssize_t)tail_sz - 22; i >= 0; --i) {
+        if (tail[i] == 0x50 && tail[i + 1] == 0x4b && tail[i + 2] == 0x05 && tail[i + 3] == 0x06) {
+            uint16_t comment_len = zip_u16(tail + i + 20);
+            if ((size_t)i + 22 + comment_len == tail_sz) {
+                eocd_pos = i;
+                break;
+            }
+        }
+    }
+    if (eocd_pos < 0) {
+        oh2_log_error("macho_load_from_apk: ZIP EOCD not found in '%s'", apk_path);
+        free(tail);
+        close(fd);
+        return -1;
+    }
+
+    uint32_t cd_size = zip_u32(tail + eocd_pos + 12);
+    uint32_t cd_off  = zip_u32(tail + eocd_pos + 16);
+    free(tail);
+
+    if ((uint64_t)cd_off + cd_size > (uint64_t)st.st_size || cd_size < 46) {
+        oh2_log_error("macho_load_from_apk: invalid CD bounds in '%s'", apk_path);
+        close(fd);
+        return -1;
+    }
+
+    uint8_t *cd = (uint8_t *)malloc(cd_size);
+    if (!cd) {
+        close(fd);
+        return -1;
+    }
+    if (pread(fd, cd, cd_size, (off_t)cd_off) != (ssize_t)cd_size) {
+        free(cd);
+        close(fd);
+        return -1;
+    }
+
+    size_t target_len = strlen(entry_name);
+    off_t found_data_off = -1;
+    size_t found_size = 0;
+
+    size_t pos = 0;
+    while (pos + 46 <= cd_size) {
+        if (zip_u32(cd + pos) != 0x02014b50U) break;
+        uint16_t method    = zip_u16(cd + pos + 10);
+        uint32_t uncomp_sz = zip_u32(cd + pos + 24);
+        uint16_t name_len  = zip_u16(cd + pos + 28);
+        uint16_t extra_len = zip_u16(cd + pos + 30);
+        uint16_t cmt_len   = zip_u16(cd + pos + 32);
+        uint32_t lfh_off   = zip_u32(cd + pos + 42);
+        if (pos + 46 + name_len > cd_size) break;
+
+        if (name_len == target_len && memcmp(cd + pos + 46, entry_name, target_len) == 0) {
+            if (method != 0) {
+                oh2_log_error("macho_load_from_apk: entry '%s' must be ZIP_STORED (method=%u)", entry_name, method);
+                free(cd);
+                close(fd);
+                return -1;
+            }
+            uint8_t lfh[30];
+            if (pread(fd, lfh, sizeof(lfh), (off_t)lfh_off) != sizeof(lfh) || zip_u32(lfh) != 0x04034b50U) {
+                free(cd);
+                close(fd);
+                return -1;
+            }
+            uint16_t lfh_nlen = zip_u16(lfh + 26);
+            uint16_t lfh_xlen = zip_u16(lfh + 28);
+            found_data_off = (off_t)lfh_off + 30 + (off_t)lfh_nlen + (off_t)lfh_xlen;
+            found_size = (size_t)uncomp_sz;
+            break;
+        }
+        pos += 46 + name_len + extra_len + cmt_len;
+    }
+
+    free(cd);
+    close(fd);
+
+    if (found_data_off < 0) {
+        oh2_log_error("macho_load_from_apk: entry '%s' not found in '%s'", entry_name, apk_path);
+        return -1;
+    }
+    oh2_log_info("APK Mach-O entry '%s': data_offset=0x%llx size=%zu (mod16k=%lld)",
+                 entry_name, (unsigned long long)found_data_off, found_size,
+                 (long long)(found_data_off & 0x3FFFLL));
+    return macho_load_at_offset(apk_path, found_data_off, found_size, out_img);
 }
 
 void *macho_lookup_export(const MachOImage *img, const char *sym_name) {

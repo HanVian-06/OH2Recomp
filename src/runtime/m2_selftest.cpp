@@ -508,7 +508,9 @@ static int test_uikit_cadisplaylink(void) {
     struct TestRect64 { double x, y, w, h; };
     typedef TestRect64 (*bounds_t)(void *, const char *);
     TestRect64 rect = ((bounds_t)oh2_objc_msgSend)(scr, "bounds");
-    if (!app || sc != 2.0 || rect.w != 2340.0 || rect.h != 1080.0) return 1;
+    TestRect64 nrect = ((bounds_t)oh2_objc_msgSend)(scr, "nativeBounds");
+    if (!app || sc != 2.0 || nrect.w != 2340.0 || nrect.h != 1080.0 ||
+        (rect.w != 1170.0 && rect.w != 2340.0) || (rect.h != 540.0 && rect.h != 1080.0)) return 1;
 
     void *target_obj = oh2_objc_alloc_instance(oh2_objc_get_class("NSObject"), 64);
     const char *cb_sel = oh2_objc_intern_selector("m2DisplayLinkTick:");

@@ -87,6 +87,22 @@ struct DarwinBlockLayout {
     DarwinBlockDescBasic *descriptor;
 };
 
+struct DarwinBlockByref {
+    void             *isa;
+    DarwinBlockByref *forwarding;
+    volatile int32_t  flags;
+    uint32_t          size;
+};
+
+struct DarwinBlockByrefKeepDispose {
+    void             *isa;
+    DarwinBlockByref *forwarding;
+    volatile int32_t  flags;
+    uint32_t          size;
+    void (*byref_keep)(void *dst, void *src);
+    void (*byref_dispose)(void *src);
+};
+
 /* ============================================================================
  * 4. Grand Central Dispatch (libdispatch) main & global queues + semaphores
  * ============================================================================ */
@@ -118,8 +134,14 @@ static std::atomic<int> g_hit_metal_rhi_boundary{0};
 
 extern "C" {
 
+static void *oh2_Block_copy(const void *arg);
+static void  oh2_Block_release(const void *arg);
+
 static void *oh2_objc_retain(void *obj) {
     if (!obj) return nullptr;
+    if (oh2_objc_is_block(obj)) {
+        return oh2_Block_copy(obj);
+    }
     if (oh2_objc_is_heap_object(obj)) {
         oh2_objc_add_refcount(obj, 1);
     }
@@ -127,10 +149,15 @@ static void *oh2_objc_retain(void *obj) {
 }
 
 static void oh2_objc_release(void *obj) {
-    if (!obj) return;
-    if (oh2_objc_is_heap_object(obj)) {
-        oh2_objc_add_refcount(obj, -1);
-    }
+    oh2_objc_release_object(obj);
+}
+
+static void oh2_dispatch_retain(void *obj) {
+    if (oh2_objc_is_heap_object(obj)) oh2_objc_add_refcount(obj, 1);
+}
+
+static void oh2_dispatch_release(void *obj) {
+    if (oh2_objc_is_heap_object(obj)) oh2_objc_release_object(obj);
 }
 
 static void *oh2_objc_autorelease(void *obj) {
@@ -188,6 +215,7 @@ static void *oh2_Block_copy(const void *arg) {
     DarwinBlockLayout *copy = (DarwinBlockLayout *)malloc(sz);
     if (!copy) return nullptr;
     memcpy(copy, src, sz);
+    copy->isa = oh2_objc_get_malloc_block_isa();
     copy->flags = (src->flags & ~OH2_BLOCK_REFCOUNT_MASK) | OH2_BLOCK_NEEDS_FREE | 2;
     if ((src->flags & OH2_BLOCK_HAS_COPY_DISPOSE) && src->descriptor) {
         const DarwinBlockDescCopy *dc = (const DarwinBlockDescCopy *)src->descriptor;
@@ -218,19 +246,93 @@ static void oh2_Block_release(const void *arg) {
 }
 
 static void oh2_Block_object_assign(void *dstAddr, const void *object, int flags) {
-    (void)flags;
     if (!dstAddr) return;
-    if ((flags & 0x07) == 7 && object) { /* BLOCK_FIELD_IS_BLOCK */
+    if (!object) {
+        *(void **)dstAddr = nullptr;
+        return;
+    }
+    const int kind = flags & 0x1f;
+    if (kind == 7) { /* BLOCK_FIELD_IS_BLOCK */
         *(void **)dstAddr = oh2_Block_copy(object);
+    } else if (kind == 3) { /* BLOCK_FIELD_IS_OBJECT */
+        *(void **)dstAddr = (flags & 0x80)
+                                ? const_cast<void *>(object)
+                                : oh2_objc_retain(const_cast<void *>(object));
+    } else if (kind == 8) { /* BLOCK_FIELD_IS_BYREF */
+        DarwinBlockByref *src_byref = ((DarwinBlockByref *)const_cast<void *>(object))->forwarding;
+        if (!src_byref) src_byref = (DarwinBlockByref *)const_cast<void *>(object);
+        if ((src_byref->flags & OH2_BLOCK_NEEDS_FREE) == 0) {
+            size_t bsz = (src_byref->size >= sizeof(DarwinBlockByref) && src_byref->size < 65536)
+                             ? (size_t)src_byref->size
+                             : sizeof(DarwinBlockByrefKeepDispose);
+            DarwinBlockByref *copy = (DarwinBlockByref *)malloc(bsz);
+            if (copy) {
+                memcpy(copy, src_byref, bsz);
+                copy->forwarding = copy;
+                src_byref->forwarding = copy;
+                copy->flags = (src_byref->flags & ~OH2_BLOCK_REFCOUNT_MASK) | OH2_BLOCK_NEEDS_FREE | 2;
+                if ((src_byref->flags & OH2_BLOCK_HAS_COPY_DISPOSE) &&
+                    bsz >= sizeof(DarwinBlockByrefKeepDispose)) {
+                    auto *kd = (DarwinBlockByrefKeepDispose *)src_byref;
+                    if (kd->byref_keep) kd->byref_keep(copy, src_byref);
+                }
+                *(void **)dstAddr = copy;
+            } else {
+                *(void **)dstAddr = src_byref;
+            }
+        } else {
+            __atomic_fetch_add(&src_byref->flags, 2, __ATOMIC_RELAXED);
+            *(void **)dstAddr = src_byref;
+        }
     } else {
         *(const void **)dstAddr = object;
     }
 }
 
 static void oh2_Block_object_dispose(const void *object, int flags) {
-    if ((flags & 0x07) == 7 && object) {
+    if (!object) return;
+    const int kind = flags & 0x1f;
+    if (kind == 7) { /* BLOCK_FIELD_IS_BLOCK */
         oh2_Block_release(object);
+    } else if (kind == 3) { /* BLOCK_FIELD_IS_OBJECT */
+        if (!(flags & 0x80)) {
+            oh2_objc_release(const_cast<void *>(object));
+        }
+    } else if (kind == 8) { /* BLOCK_FIELD_IS_BYREF */
+        DarwinBlockByref *byref = ((DarwinBlockByref *)const_cast<void *>(object))->forwarding;
+        if (!byref) byref = (DarwinBlockByref *)const_cast<void *>(object);
+        if (byref->flags & OH2_BLOCK_NEEDS_FREE) {
+            int32_t prev = __atomic_fetch_sub(&byref->flags, 2, __ATOMIC_ACQ_REL);
+            if ((prev & OH2_BLOCK_REFCOUNT_MASK) <= 2) {
+                if ((byref->flags & OH2_BLOCK_HAS_COPY_DISPOSE) &&
+                    byref->size >= sizeof(DarwinBlockByrefKeepDispose)) {
+                    auto *kd = (DarwinBlockByrefKeepDispose *)byref;
+                    if (kd->byref_dispose) kd->byref_dispose(byref);
+                }
+                free(byref);
+            }
+        }
     }
+}
+
+static void *imp_block_copy_or_retain(void *self, const char *sel) {
+    (void)sel;
+    return oh2_Block_copy(self);
+}
+
+static void imp_block_release(void *self, const char *sel) {
+    (void)sel;
+    oh2_Block_release(self);
+}
+
+static void *imp_global_block_retain(void *self, const char *sel) {
+    (void)sel;
+    return self;
+}
+
+static void imp_global_block_release(void *self, const char *sel) {
+    (void)self;
+    (void)sel;
 }
 
 static void *gcd_async_worker(void *arg) {
@@ -411,7 +513,7 @@ void oh2_dispatch_drain_main_queue(void) {
 
 void oh2_perform_selector_on_main_thread(void *target, const char *selector, void *arg, int wait) {
     if (!target || !selector) return;
-    if (getpid() == gettid()) {
+    if (oh2_is_ios_main_thread()) {
         typedef void (*msg1_t)(void *, const char *, void *);
         ((msg1_t)oh2_objc_msgSend)(target, selector, arg);
         return;
@@ -450,6 +552,111 @@ static void *oh2_m2_MTLCreateSystemDefaultDevice(void) {
     return nullptr;
 }
 
+/* dispatch_data_t & extra GCD primitives needed by UE4 shader loading & Metal RHI */
+static void *oh2_dispatch_data_create(const void *buffer, size_t size, void *queue, void *destructor) {
+    (void)queue; (void)destructor;
+    return oh2_objc_data_create(buffer, size);
+}
+
+static size_t oh2_dispatch_data_get_size(const void *data) {
+    return oh2_objc_data_length(data);
+}
+
+static void *oh2_dispatch_data_create_map(const void *data, const void **buffer_ptr, size_t *size_ptr) {
+    const void *ptr = oh2_objc_data_bytes(data);
+    size_t sz = oh2_objc_data_length(data);
+    if (buffer_ptr) *buffer_ptr = ptr;
+    if (size_ptr) *size_ptr = sz;
+    return const_cast<void *>(data);
+}
+
+static bool oh2_dispatch_data_apply(const void *data, void *applier_block) {
+    if (!data || !applier_block) return true;
+    const void *ptr = oh2_objc_data_bytes(data);
+    size_t sz = oh2_objc_data_length(data);
+    if (!ptr || sz == 0) return true;
+    typedef uint8_t (*apply_fn_t)(void *, void *, size_t, const void *, size_t);
+    DarwinBlockLayout *b = (DarwinBlockLayout *)applier_block;
+    if (b->invoke) {
+        ((apply_fn_t)b->invoke)(b, nullptr, 0, ptr, sz);
+    }
+    return true;
+}
+
+static void *oh2_dispatch_group_create(void) {
+    DarwinDispatchSemaM2 *g = (DarwinDispatchSemaM2 *)calloc(1, sizeof(DarwinDispatchSemaM2));
+    if (!g) return nullptr;
+    pthread_mutex_init(&g->mtx, nullptr);
+    pthread_cond_init(&g->cv, nullptr);
+    g->count = 0;
+    return g;
+}
+
+static void oh2_dispatch_group_enter(void *group) {
+    if (!group) return;
+    DarwinDispatchSemaM2 *g = (DarwinDispatchSemaM2 *)group;
+    pthread_mutex_lock(&g->mtx);
+    g->count++;
+    pthread_mutex_unlock(&g->mtx);
+}
+
+static void oh2_dispatch_group_leave(void *group) {
+    if (!group) return;
+    DarwinDispatchSemaM2 *g = (DarwinDispatchSemaM2 *)group;
+    pthread_mutex_lock(&g->mtx);
+    if (g->count > 0) g->count--;
+    if (g->count == 0) pthread_cond_broadcast(&g->cv);
+    pthread_mutex_unlock(&g->mtx);
+}
+
+static long oh2_dispatch_group_wait(void *group, uint64_t timeout) {
+    if (!group) return 0;
+    DarwinDispatchSemaM2 *g = (DarwinDispatchSemaM2 *)group;
+    pthread_mutex_lock(&g->mtx);
+    if (timeout == ~0ULL) {
+        while (g->count > 0) pthread_cond_wait(&g->cv, &g->mtx);
+        pthread_mutex_unlock(&g->mtx);
+        return 0;
+    }
+    if (timeout == 0ULL) {
+        long res = (g->count == 0) ? 0 : 1;
+        pthread_mutex_unlock(&g->mtx);
+        return res;
+    }
+    struct timespec now_rt;
+    clock_gettime(CLOCK_REALTIME, &now_rt);
+    uint64_t t_ns = (uint64_t)now_rt.tv_sec * 1000000000ULL + (uint64_t)now_rt.tv_nsec + 10000000ULL;
+    struct timespec abs_rt{(time_t)(t_ns / 1000000000ULL), (long)(t_ns % 1000000000ULL)};
+    while (g->count > 0) {
+        if (pthread_cond_timedwait(&g->cv, &g->mtx, &abs_rt) != 0) break;
+    }
+    long res = (g->count == 0) ? 0 : 1;
+    pthread_mutex_unlock(&g->mtx);
+    return res;
+}
+
+static void oh2_dispatch_group_async(void *group, void *queue, void *block) {
+    if (!block) return;
+    oh2_dispatch_group_enter(group);
+    DarwinBlockLayout *b = (DarwinBlockLayout *)oh2_Block_copy(block);
+    if (b && b->invoke) {
+        b->invoke(b);
+        oh2_Block_release(b);
+    }
+    oh2_dispatch_group_leave(group);
+    (void)queue;
+}
+
+static void oh2_dispatch_group_notify(void *group, void *queue, void *block) {
+    oh2_dispatch_group_wait(group, ~0ULL);
+    oh2_dispatch_async(queue, block);
+}
+
+static void oh2_dispatch_after(uint64_t when, void *queue, void *block) {
+    (void)when;
+    oh2_dispatch_async(queue, block);
+}
+
 int oh2_runtime_did_hit_metal_boundary(void) {
     return g_hit_metal_rhi_boundary.load();
 }
@@ -477,6 +684,9 @@ void oh2_m2_register_objc_runtime(void) {
 
     oh2_symbol_register_override("_dispatch_async",                (void *)&oh2_dispatch_async);
     oh2_symbol_register_override("_dispatch_sync",                 (void *)&oh2_dispatch_sync);
+    oh2_symbol_register_override("_dispatch_barrier_async",        (void *)&oh2_dispatch_async);
+    oh2_symbol_register_override("_dispatch_barrier_sync",         (void *)&oh2_dispatch_sync);
+    oh2_symbol_register_override("_dispatch_after",                (void *)&oh2_dispatch_after);
     oh2_symbol_register_override("_dispatch_get_global_queue",     (void *)&oh2_dispatch_get_global_queue);
     oh2_symbol_register_override("_dispatch_get_main_queue",       (void *)&oh2_dispatch_get_main_queue);
     oh2_symbol_register_override("_dispatch_queue_create",         (void *)&oh2_dispatch_queue_create);
@@ -485,8 +695,28 @@ void oh2_m2_register_objc_runtime(void) {
     oh2_symbol_register_override("_dispatch_semaphore_create",     (void *)&oh2_dispatch_semaphore_create);
     oh2_symbol_register_override("_dispatch_semaphore_signal",     (void *)&oh2_dispatch_semaphore_signal);
     oh2_symbol_register_override("_dispatch_semaphore_wait",       (void *)&oh2_dispatch_semaphore_wait);
+    oh2_symbol_register_override("_dispatch_retain",               (void *)&oh2_dispatch_retain);
+    oh2_symbol_register_override("_dispatch_release",              (void *)&oh2_dispatch_release);
+    oh2_symbol_register_override("_dispatch_data_create",          (void *)&oh2_dispatch_data_create);
+    oh2_symbol_register_override("_dispatch_data_get_size",        (void *)&oh2_dispatch_data_get_size);
+    oh2_symbol_register_override("_dispatch_data_create_map",      (void *)&oh2_dispatch_data_create_map);
+    oh2_symbol_register_override("_dispatch_data_apply",           (void *)&oh2_dispatch_data_apply);
+    oh2_symbol_register_override("_dispatch_group_create",         (void *)&oh2_dispatch_group_create);
+    oh2_symbol_register_override("_dispatch_group_enter",          (void *)&oh2_dispatch_group_enter);
+    oh2_symbol_register_override("_dispatch_group_leave",          (void *)&oh2_dispatch_group_leave);
+    oh2_symbol_register_override("_dispatch_group_wait",           (void *)&oh2_dispatch_group_wait);
+    oh2_symbol_register_override("_dispatch_group_async",          (void *)&oh2_dispatch_group_async);
+    oh2_symbol_register_override("_dispatch_group_notify",         (void *)&oh2_dispatch_group_notify);
 
     oh2_symbol_register_override("_MTLCreateSystemDefaultDevice",  (void *)&oh2_m2_MTLCreateSystemDefaultDevice);
+
+    oh2_objc_register_autorelease_hook(&oh2_objc_autorelease);
+
+    oh2_objc_register_block_methods((void *)&imp_block_copy_or_retain,
+                                    (void *)&imp_block_copy_or_retain,
+                                    (void *)&imp_block_release,
+                                    (void *)&imp_global_block_retain,
+                                    (void *)&imp_global_block_release);
 }
 
 } /* extern "C" */

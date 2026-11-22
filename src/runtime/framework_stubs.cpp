@@ -249,11 +249,93 @@ extern "C" void oh2_m2_register_framework_stubs(void) {
     oh2_objc_register_instance_method("DCDevice", "generateTokenWithCompletionHandler:", (void *)&dc_generateToken);
 
     /* AVFoundation & NSNotificationCenter no-crash stubs */
-    oh2_objc_register_instance_method("AVAudioSession",       "isOtherAudioPlaying", (void *)&stub_ret_no);
-    oh2_objc_register_instance_method("AVAudioSession",       "setCategory:withOptions:error:", (void *)&stub_ret_yes);
+    static auto stub_ret_zero_dbl = +[](void *, const char *) -> double { return 0.0; };
+    static auto stub_ret_sr_dbl   = +[](void *, const char *) -> double { return 48000.0; };
+    static auto stub_ret_iobuf    = +[](void *, const char *) -> double { return 0.005; };
+    static auto stub_ret_bool_yes_out = +[](void *, const char *, double, void **err) -> uint8_t { if (err) *err = nullptr; return 1; };
+    static auto stub_ret_empty_arr = +[](void *, const char *) -> void * { return oh2_objc_array_create(nullptr, 0); };
+    static auto stub_set_cat_mode  = +[](void *, const char *, void *, void *, uint64_t, void **err) -> uint8_t { if (err) *err = nullptr; return 1; };
+    static auto stub_av_route      = +[](void *, const char *) -> void * {
+        static void *route_obj = nullptr;
+        if (!route_obj) {
+            void *cls = oh2_objc_ensure_class("AVAudioSessionRouteDescription", "NSObject");
+            route_obj = oh2_objc_alloc_instance(cls, 64);
+            oh2_objc_register_instance_method("AVAudioSessionRouteDescription", "outputs", (void *)stub_ret_empty_arr);
+        }
+        return route_obj;
+    };
+    static auto stub_gc_discover = +[](void *, const char *, void *handler) {
+        if (handler) {
+            struct Blk0 { void *isa; int32_t f, r; void (*inv)(void *); };
+            auto *b = (Blk0 *)handler;
+            if (b->inv) b->inv(handler);
+        }
+    };
+
+    oh2_objc_register_instance_method("AVAudioSession", "isOtherAudioPlaying",            (void *)&stub_ret_no);
+    oh2_objc_register_instance_method("AVAudioSession", "setCategory:withOptions:error:", (void *)&stub_ret_yes);
+    oh2_objc_register_instance_method("AVAudioSession", "setCategory:mode:options:error:", (void *)stub_set_cat_mode);
+    oh2_objc_register_instance_method("AVAudioSession", "preferredSampleRate",            (void *)stub_ret_sr_dbl);
+    oh2_objc_register_instance_method("AVAudioSession", "preferredIOBufferDuration",      (void *)stub_ret_iobuf);
+    oh2_objc_register_instance_method("AVAudioSession", "setPreferredSampleRate:error:",  (void *)stub_ret_bool_yes_out);
+    oh2_objc_register_instance_method("AVAudioSession", "setPreferredIOBufferDuration:error:", (void *)stub_ret_bool_yes_out);
+    oh2_objc_register_instance_method("AVAudioSession", "currentRoute",                   (void *)stub_av_route);
+    oh2_objc_register_instance_method("AVAudioSession", "recordPermission",               (void *)&stub_kern_success);
+    (void)stub_ret_zero_dbl;
+
+    /* AVAudioPlayer / AVPlayer / AVPlayerItem / AVURLAsset / AVAssetReader */
+    oh2_objc_register_instance_method("AVAudioPlayer", "initWithContentsOfURL:error:",   (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("AVAudioPlayer", "initWithData:error:",            (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("AVAudioPlayer", "prepareToPlay",                  (void *)&stub_ret_no);
+    oh2_objc_register_instance_method("AVAudioPlayer", "play",                           (void *)&stub_ret_no);
+    oh2_objc_register_instance_method("AVAudioPlayer", "stop",                           (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("AVAudioPlayer", "pause",                          (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("AVAudioPlayer", "isPlaying",                      (void *)&stub_ret_no);
+    oh2_objc_register_instance_method("AVAudioPlayer", "setVolume:",                     (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("AVAudioPlayer", "setNumberOfLoops:",              (void *)&stub_ret_nil);
+    oh2_objc_register_class_method("AVURLAsset",     "URLAssetWithURL:options:",         (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("AVURLAsset",  "initWithURL:options:",             (void *)&stub_ret_self);
+    oh2_objc_register_instance_method("AVURLAsset",  "tracksWithMediaType:",             (void *)stub_ret_empty_arr);
+    oh2_objc_register_instance_method("AVURLAsset",  "tracks",                           (void *)stub_ret_empty_arr);
+    oh2_objc_register_class_method("AVPlayerItem",   "playerItemWithAsset:",             (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("AVPlayer",    "replaceCurrentItemWithPlayerItem:", (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("AVPlayer",    "play",                             (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("AVPlayer",    "pause",                            (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("AVPlayer",    "setRate:",                         (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("AVPlayer",    "setMuted:",                        (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("AVPlayer",    "setVolume:",                       (void *)&stub_ret_nil);
+
+    /* GameController */
+    oh2_objc_register_class_method("GCController",   "controllers",                      (void *)stub_ret_empty_arr);
+    oh2_objc_register_class_method("GCController",   "startWirelessControllerDiscoveryWithCompletionHandler:", (void *)stub_gc_discover);
+    oh2_objc_register_instance_method("GCController", "extendedGamepad",                 (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("GCController", "vendorName",                      (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("GCController", "playerIndex",                     (void *)&stub_kern_success);
+    oh2_objc_register_instance_method("GCController", "setPlayerIndex:",                 (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("GCController", "setControllerPausedHandler:",     (void *)&stub_ret_nil);
+
+    /* EAGLContext / CAEAGLLayer */
+    oh2_objc_register_class_method("EAGLContext",    "currentContext",                   (void *)&stub_ret_nil);
+    oh2_objc_register_class_method("EAGLContext",    "setCurrentContext:",               (void *)&stub_ret_yes);
+    oh2_objc_register_instance_method("EAGLContext", "initWithAPI:",                     (void *)&stub_ret_self);
+    oh2_objc_register_instance_method("EAGLContext", "initWithAPI:sharegroup:",          (void *)&stub_ret_self);
+    oh2_objc_register_instance_method("EAGLContext", "renderbufferStorage:fromDrawable:", (void *)&stub_ret_no);
+    oh2_objc_register_instance_method("EAGLContext", "presentRenderbuffer:",             (void *)&stub_ret_no);
+    oh2_objc_register_instance_method("EAGLContext", "API",                              (void *)&stub_kern_success);
+    oh2_objc_register_instance_method("EAGLContext", "sharegroup",                       (void *)&stub_ret_nil);
+
+    /* NSNotificationCenter & CMMotionManager */
     oh2_objc_register_instance_method("NSNotificationCenter", "addObserver:selector:name:object:", (void *)&stub_ret_nil);
     oh2_objc_register_instance_method("NSNotificationCenter", "addObserverForName:object:queue:usingBlock:", (void *)&stub_ret_nil);
     oh2_objc_register_instance_method("NSNotificationCenter", "removeObserver:", (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("NSNotificationCenter", "removeObserver:name:object:", (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("CMMotionManager", "isDeviceMotionAvailable",        (void *)&stub_ret_no);
+    oh2_objc_register_instance_method("CMMotionManager", "isDeviceMotionActive",           (void *)&stub_ret_no);
+    oh2_objc_register_instance_method("CMMotionManager", "setDeviceMotionUpdateInterval:", (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("CMMotionManager", "startDeviceMotionUpdates",       (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("CMMotionManager", "startAccelerometerUpdates",      (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("CMMotionManager", "deviceMotion",                   (void *)&stub_ret_nil);
+    oh2_objc_register_instance_method("CMMotionManager", "accelerometerData",              (void *)&stub_ret_nil);
 
     /* Mach exception-port functions neutralized so PLCrashReporter can never trigger Mach IPC */
     oh2_symbol_register_override("_exception_raise",                 (void *)&stub_kern_success);

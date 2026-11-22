@@ -30,6 +30,7 @@ enum SpirvShaderEntryFlags {
     SPIRV_ENTRY_FLAG_USES_KILL         = (1u << 2),
     SPIRV_ENTRY_FLAG_RELAXED_PRECISION = (1u << 3),
     SPIRV_ENTRY_FLAG_FRAG_DEPTH        = (1u << 4),
+    SPIRV_ENTRY_FLAG_FB_FETCH          = (1u << 5),
 };
 
 /* Metal resource kind (SpirvBindingDesc::metal_kind) */
@@ -171,6 +172,7 @@ void spirv_cache_unload(void);
 const SpirvShaderEntry* spirv_cache_find_by_mtlb(const void* mtlb_data, size_t size);
 const SpirvShaderEntry* spirv_cache_find_by_pak_sha1(const uint8_t pak_sha1[20]);
 const SpirvShaderEntry* spirv_cache_find_by_entry_name(const char* entry_name);
+const SpirvShaderEntry* spirv_cache_entry_at(uint32_t index);
 uint32_t spirv_cache_count(void);
 const SpirvCacheHeader* spirv_cache_header(void);
 const char* spirv_cache_string(uint32_t string_offset);

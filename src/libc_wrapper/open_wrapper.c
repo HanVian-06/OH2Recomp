@@ -33,6 +33,8 @@ typedef struct {
 
 static TrackedPakFd g_tracked_fds[16];
 static Oh2PakIoTelemetry g_pak_telemetry;
+static void *g_pak_ro_mmap = NULL;
+static size_t g_pak_ro_mmap_size = 0;
 
 static int is_oh2_pak_path(const char *path) {
     if (!path) return 0;
@@ -93,7 +95,16 @@ void oh2_pak_telemetry_track_fd_open(int fd, const char *resolved_path) {
     pthread_mutex_lock(&g_pak_io_lock);
     g_pak_telemetry.opened_by_ue4 = 1;
     snprintf(g_pak_telemetry.opened_path, sizeof(g_pak_telemetry.opened_path), "%s", resolved_path);
-    if (sz > 0) g_pak_telemetry.fstat_size = sz;
+    if (sz > 0) {
+        g_pak_telemetry.fstat_size = sz;
+        if (!g_pak_ro_mmap) {
+            void *mp = mmap(NULL, (size_t)sz, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (mp != MAP_FAILED) {
+                g_pak_ro_mmap = mp;
+                g_pak_ro_mmap_size = (size_t)sz;
+            }
+        }
+    }
     for (int i = 0; i < 16; ++i) {
         if (!g_tracked_fds[i].in_use || g_tracked_fds[i].fd == fd) {
             g_tracked_fds[i].in_use = 1;
@@ -335,6 +346,18 @@ int oh2_translate_darwin_open_flags(int d_flags) {
     return l_flags;
 }
 
+static void ensure_parent_dirs(const char *path) {
+    char tmp[1024];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; ++p) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, 0775);
+            *p = '/';
+        }
+    }
+}
+
 int oh2_darwin_open_impl(const char *path, int d_flags, char *darwin_sp) {
     if (!path) {
         errno = EINVAL;
@@ -350,6 +373,10 @@ int oh2_darwin_open_impl(const char *path, int d_flags, char *darwin_sp) {
         mode = (mode_t)(*(uint64_t *)darwin_sp);
     }
     int fd = open(translated, l_flags, mode);
+    if (fd < 0 && (l_flags & O_CREAT) && errno == ENOENT) {
+        ensure_parent_dirs(translated);
+        fd = open(translated, l_flags, mode);
+    }
     if (fd < 0) {
         oh2_sync_darwin_errno();
         return -1;
@@ -378,6 +405,10 @@ FILE *oh2_darwin_fopen(const char *path, const char *mode) {
     char translated[1024];
     oh2_libc_wrapper_translate_path(path, translated, sizeof(translated));
     FILE *fp = fopen(translated, mode);
+    if (!fp && errno == ENOENT && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+'))) {
+        ensure_parent_dirs(translated);
+        fp = fopen(translated, mode);
+    }
     if (!fp) {
         oh2_sync_darwin_errno();
         return NULL;
@@ -542,6 +573,10 @@ int oh2_darwin_utime(const char *path, const void *times) {
 }
 
 void *oh2_darwin_malloc(size_t size) {
+    /* UE4 FMallocBinned::Realloc reads up to 0xe0 (224) bytes when promoted from _malloc; clamp floor. */
+    if (size < 224) {
+        size = 224;
+    }
     if (size >= 0x4000ULL) {
         size_t align = (size >= 0x10000ULL && (size & 0x3fffULL) == 0) ? 0x10000ULL : 0x4000ULL;
         void *p = NULL;

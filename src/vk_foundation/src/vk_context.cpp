@@ -37,6 +37,12 @@ bool supports_astc_format(VkPhysicalDevice phys, VkFormat fmt) {
     return (props.optimalTilingFeatures & kReq) == kReq;
 }
 
+bool supports_depth_format(VkPhysicalDevice phys, VkFormat fmt) {
+    VkFormatProperties props{};
+    vkGetPhysicalDeviceFormatProperties(phys, fmt, &props);
+    return (props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+}
+
 }  // namespace
 
 VkContext::~VkContext() {
@@ -93,6 +99,20 @@ bool VkContext::recreate_swapchain(ANativeWindow* window) {
     if (!device_ || !window) return false;
     vkDeviceWaitIdle(device_);
     destroy_swapchain();
+    return create_swapchain(window);
+}
+
+bool VkContext::rebind_surface(ANativeWindow* window) {
+    if (!instance_ || !device_ || !window) return false;
+    vkDeviceWaitIdle(device_);
+    destroy_swapchain();
+    if (surface_ != VK_NULL_HANDLE) {
+        vkDestroySurfaceKHR(instance_, surface_, nullptr);
+        surface_ = VK_NULL_HANDLE;
+    }
+    if (!create_surface(window)) {
+        return false;
+    }
     return create_swapchain(window);
 }
 
@@ -277,16 +297,21 @@ bool VkContext::pick_physical_device() {
         vkGetPhysicalDeviceQueueFamilyProperties(phys, &qf_count, qfs.data());
 
         uint32_t chosen_qf = UINT32_MAX;
+        bool has_compute = false;
         for (uint32_t i = 0; i < qf_count; ++i) {
             if ((qfs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) continue;
             VkBool32 present_supported = VK_FALSE;
             vkGetPhysicalDeviceSurfaceSupportKHR(phys, i, surface_, &present_supported);
             if (present_supported == VK_TRUE) {
-                chosen_qf = i;
-                break;
+                if (chosen_qf == UINT32_MAX || ((qfs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0 && !has_compute)) {
+                    chosen_qf = i;
+                    has_compute = (qfs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+                    if (has_compute) break;
+                }
             }
         }
         if (chosen_qf == UINT32_MAX) continue;
+        caps_.compute_queue_supported = has_compute;
 
         uint32_t ext_count = 0;
         vkEnumerateDeviceExtensionProperties(phys, nullptr, &ext_count, nullptr);
@@ -309,6 +334,7 @@ bool VkContext::pick_physical_device() {
             std::max<VkDeviceSize>(1, props.limits.optimalBufferCopyOffsetAlignment);
         caps_.non_coherent_atom_size =
             std::max<VkDeviceSize>(1, props.limits.nonCoherentAtomSize);
+        caps_.max_sampler_anisotropy = props.limits.maxSamplerAnisotropy;
 
         caps_.has_dynamic_rendering_exts =
             has_extension(dev_exts, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) &&
@@ -340,6 +366,7 @@ bool VkContext::pick_physical_device() {
 
         vkGetPhysicalDeviceFeatures2(phys, &features2);
 
+        caps_.supported_features = features2.features;
         caps_.astc_ldr_feature = (features2.features.textureCompressionASTC_LDR == VK_TRUE);
         caps_.dynamic_rendering =
             caps_.has_dynamic_rendering_exts && (dyn_features.dynamicRendering == VK_TRUE);
@@ -355,6 +382,8 @@ bool VkContext::pick_physical_device() {
         caps_.astc_4x4_srgb = supports_astc_format(phys, VK_FORMAT_ASTC_4x4_SRGB_BLOCK);
         caps_.astc_6x6_srgb = supports_astc_format(phys, VK_FORMAT_ASTC_6x6_SRGB_BLOCK);
         caps_.astc_8x8_srgb = supports_astc_format(phys, VK_FORMAT_ASTC_8x8_SRGB_BLOCK);
+        caps_.d32_sfloat_supported = supports_depth_format(phys, VK_FORMAT_D32_SFLOAT);
+        caps_.d32_sfloat_s8_supported = supports_depth_format(phys, VK_FORMAT_D32_SFLOAT_S8_UINT);
 
         M3_LOGI("GPU=%s api=0x%x vendor=0x%x dev=0x%x dyn_render=%d desc_idx=%d astc=(%d,%d,%d)",
                 caps_.device_name, caps_.api_version, caps_.vendor_id, caps_.device_id,
@@ -391,6 +420,36 @@ bool VkContext::create_device() {
     VkPhysicalDeviceFeatures enabled_core{};
     if (caps_.astc_ldr_feature) {
         enabled_core.textureCompressionASTC_LDR = VK_TRUE;
+    }
+    if (caps_.supported_features.independentBlend) {
+        enabled_core.independentBlend = VK_TRUE;
+    }
+    if (caps_.supported_features.samplerAnisotropy) {
+        enabled_core.samplerAnisotropy = VK_TRUE;
+    }
+    if (caps_.supported_features.depthClamp) {
+        enabled_core.depthClamp = VK_TRUE;
+    }
+    if (caps_.supported_features.fillModeNonSolid) {
+        enabled_core.fillModeNonSolid = VK_TRUE;
+    }
+    if (caps_.supported_features.fragmentStoresAndAtomics) {
+        enabled_core.fragmentStoresAndAtomics = VK_TRUE;
+    }
+    if (caps_.supported_features.vertexPipelineStoresAndAtomics) {
+        enabled_core.vertexPipelineStoresAndAtomics = VK_TRUE;
+    }
+    if (caps_.supported_features.imageCubeArray) {
+        enabled_core.imageCubeArray = VK_TRUE;
+    }
+    if (caps_.supported_features.fullDrawIndexUint32) {
+        enabled_core.fullDrawIndexUint32 = VK_TRUE;
+    }
+    if (caps_.supported_features.shaderStorageImageExtendedFormats) {
+        enabled_core.shaderStorageImageExtendedFormats = VK_TRUE;
+    }
+    if (caps_.supported_features.depthBiasClamp) {
+        enabled_core.depthBiasClamp = VK_TRUE;
     }
 
     VkPhysicalDeviceDynamicRenderingFeaturesKHR enabled_dyn{};
@@ -531,6 +590,14 @@ bool VkContext::create_swapchain(ANativeWindow* window) {
         }
     }
 
+    VkImageUsageFlags sc_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (surf_caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) {
+        sc_usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    }
+    if (surf_caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
+        sc_usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    }
+
     VkSwapchainCreateInfoKHR sc_info{};
     sc_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     sc_info.surface = surface_;
@@ -539,7 +606,7 @@ bool VkContext::create_swapchain(ANativeWindow* window) {
     sc_info.imageColorSpace = swapchain_color_space_;
     sc_info.imageExtent = swapchain_extent_;
     sc_info.imageArrayLayers = 1;
-    sc_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    sc_info.imageUsage = sc_usage;
     sc_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     sc_info.preTransform = pre_transform;
     sc_info.compositeAlpha = composite_alpha;

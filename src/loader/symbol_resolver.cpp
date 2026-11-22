@@ -165,7 +165,9 @@ struct CGRect64 {
  * 128-byte negative prefix header allocated immediately BEFORE every heap ObjC instance.
  * Guarantees 0 collision with OH2 subclass ivars (e.g. FIOSView, IOSAppDelegate).
  */
-#define OH2_OBJC_HEAP_MAGIC 0x4F48324FU /* 'OH2O' */
+#define OH2_OBJC_HEAP_MAGIC       0x4F48324FU /* 'OH2O' */
+#define OH2_OBJC_FLAG_IMMORTAL    1ULL
+#define OH2_OBJC_FLAG_RECLAIMABLE 2ULL
 
 struct alignas(16) DarwinObjCPrefix {
     uint32_t    magic;
@@ -185,6 +187,8 @@ struct alignas(16) DarwinObjCPrefix {
     std::unordered_map<std::string, void *> *cpp_dict;
     int64_t     num_i64;
     double      num_f64;
+    void      (*custom_dealloc)(void *obj);
+    uint64_t    obj_flags;
 };
 
 static_assert(sizeof(DarwinObjCPrefix) % 16 == 0, "DarwinObjCPrefix must be 16-byte aligned");
@@ -201,6 +205,7 @@ extern "C" {
 DarwinObjCClass ___CFConstantStringClassReference;
 DarwinObjCClass __NSConcreteGlobalBlock;
 DarwinObjCClass __NSConcreteStackBlock;
+DarwinObjCClass __NSConcreteMallocBlock;
 uint64_t __objc_empty_cache[2] = {0, 0};
 uint64_t __dispatch_main_q[8]  = {1, 0, 0, 0, 0, 0, 0, 0};
 uint8_t  _NDR_record[16]       = {0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -281,6 +286,7 @@ static DarwinObjCClass g_cfconst_str_meta;
 
 static DarwinClassRO g_global_block_ro;
 static DarwinClassRO g_stack_block_ro;
+static DarwinClassRO g_malloc_block_ro;
 
 } /* extern "C" */
 
@@ -347,6 +353,7 @@ static DarwinObjCPrefix *get_heap_prefix(const void *obj) {
     if (!obj) return nullptr;
     uintptr_t v = (uintptr_t)obj;
     if (v < 0x10000ULL || (v & 0x7ULL) != 0) return nullptr;
+    if (oh2_objc_is_block(obj)) return nullptr;
     const MachOImage *img = macho_get_active_image();
     if (img && img->base_addr) {
         uintptr_t base = (uintptr_t)img->base_addr;
@@ -382,11 +389,14 @@ static void *alloc_objc_instance(DarwinObjCClass *cls, size_t extra_bytes = 0) {
     return obj;
 }
 
+static void *(*g_autorelease_hook)(void *obj) = nullptr;
+
 static DarwinCFString *create_darwin_cfstring(const char *utf8, size_t len) {
     DarwinCFString *s = (DarwinCFString *)alloc_objc_instance(&_OBJC_CLASS_$_NSString, len + 32);
     if (!s) return nullptr;
     DarwinObjCPrefix *pfx = get_heap_prefix(s);
     pfx->cpp_str = new std::string(utf8 ? utf8 : "", len);
+    pfx->obj_flags |= OH2_OBJC_FLAG_RECLAIMABLE;
     s->isa         = &_OBJC_CLASS_$_NSString;
     s->flags       = 0x07c8U;
     s->dynamic_tag = 0x4F483253U; /* 'OH2S' */
@@ -1293,8 +1303,12 @@ static long darwin_dispatch_semaphore_wait(void *dsema, uint64_t timeout) {
     return 0;
 }
 
-static void darwin_dispatch_retain(void *obj)  { (void)obj; }
-static void darwin_dispatch_release(void *obj) { (void)obj; }
+static void darwin_dispatch_retain(void *obj) {
+    if (oh2_objc_is_heap_object(obj)) oh2_objc_add_refcount(obj, 1);
+}
+static void darwin_dispatch_release(void *obj) {
+    if (oh2_objc_is_heap_object(obj)) oh2_objc_release_object(obj);
+}
 
 static bool darwin_availability_version_check(uint32_t count, const void *versions) {
     (void)count;
@@ -1372,12 +1386,14 @@ namespace {
 static const void *darwin_CFRetain(const void *cf) {
     if (!cf) return nullptr;
     DarwinObjCPrefix *pfx = get_heap_prefix(cf);
-    if (pfx) __atomic_add_fetch(&pfx->refcount, 1, __ATOMIC_RELAXED);
+    if (pfx && !(pfx->obj_flags & OH2_OBJC_FLAG_IMMORTAL)) {
+        __atomic_add_fetch(&pfx->refcount, 1, __ATOMIC_RELAXED);
+    }
     return cf;
 }
 
 static void darwin_CFRelease(const void *cf) {
-    (void)cf;
+    oh2_objc_release_object(const_cast<void *>(cf));
 }
 
 static uint64_t darwin_CFGetTypeID(const void *cf) {
@@ -1548,6 +1564,7 @@ static void *darwin_CFDataCreateWithBytesNoCopy(void *allocator, const uint8_t *
     } else {
         pfx->cpp_str = new std::string();
     }
+    pfx->obj_flags |= OH2_OBJC_FLAG_RECLAIMABLE;
     return d;
 }
 
@@ -1643,17 +1660,24 @@ static void *darwin_objc_alloc(DarwinObjCClass *cls) {
 
 static void *darwin_objc_retain(void *obj) {
     if (!obj) return nullptr;
+    if (oh2_objc_is_block(obj)) {
+        typedef void *(*bcopy_t)(const void *);
+        static bcopy_t fn = (bcopy_t)darwin_resolve_symbol(nullptr, "__Block_copy");
+        return fn ? fn(obj) : obj;
+    }
     DarwinObjCPrefix *pfx = get_heap_prefix(obj);
-    if (pfx) __atomic_add_fetch(&pfx->refcount, 1, __ATOMIC_RELAXED);
+    if (pfx && !(pfx->obj_flags & OH2_OBJC_FLAG_IMMORTAL)) {
+        __atomic_add_fetch(&pfx->refcount, 1, __ATOMIC_RELAXED);
+    }
     return obj;
 }
 
 static void darwin_objc_release(void *obj) {
-    (void)obj;
+    oh2_objc_release_object(obj);
 }
 
 static void *darwin_objc_autorelease(void *obj) {
-    return obj;
+    return g_autorelease_hook ? g_autorelease_hook(obj) : obj;
 }
 
 static void *darwin_objc_autoreleasePoolPush(void) {
@@ -1795,8 +1819,8 @@ static void *imp_nsobject_new(DarwinObjCClass *cls, const char *sel) {
 }
 static void *imp_nsobject_self(void *self, const char *sel) { (void)sel; return self; }
 static void *imp_nsobject_retain(void *self, const char *sel) { (void)sel; return darwin_objc_retain(self); }
-static void  imp_nsobject_release(void *self, const char *sel) { (void)sel; }
-static void *imp_nsobject_autorelease(void *self, const char *sel) { (void)sel; return self; }
+static void  imp_nsobject_release(void *self, const char *sel) { (void)sel; oh2_objc_release_object(self); }
+static void *imp_nsobject_autorelease(void *self, const char *sel) { (void)sel; return g_autorelease_hook ? g_autorelease_hook(self) : self; }
 static void  imp_nsobject_dealloc(void *self, const char *sel) { (void)self; (void)sel; }
 static void *imp_nsobject_copy(void *self, const char *sel) { (void)sel; return self; }
 static void *imp_nsobject_class_inst(void *self, const char *sel) {
@@ -1983,6 +2007,7 @@ static void *imp_nsbundle_mainBundle(DarwinObjCClass *cls, const char *sel) {
     (void)cls; (void)sel;
     if (!g_main_bundle) {
         g_main_bundle = alloc_objc_instance(&_OBJC_CLASS_$_NSBundle);
+        oh2_objc_mark_immortal(g_main_bundle);
     }
     return g_main_bundle;
 }
@@ -2025,7 +2050,10 @@ static void *imp_nsbundle_infoDictionary(void *self, const char *sel) {
 /* UIDevice */
 static void *imp_uidevice_currentDevice(DarwinObjCClass *cls, const char *sel) {
     (void)cls; (void)sel;
-    if (!g_current_device) g_current_device = alloc_objc_instance(&_OBJC_CLASS_$_UIDevice);
+    if (!g_current_device) {
+        g_current_device = alloc_objc_instance(&_OBJC_CLASS_$_UIDevice);
+        oh2_objc_mark_immortal(g_current_device);
+    }
     return g_current_device;
 }
 static void *imp_uidevice_systemVersion(void *self, const char *sel) {
@@ -2052,6 +2080,7 @@ static void *imp_uiscreen_mainScreen(DarwinObjCClass *cls, const char *sel) {
         g_main_screen = alloc_objc_instance(&_OBJC_CLASS_$_UIScreen);
         DarwinObjCPrefix *pfx = get_heap_prefix(g_main_screen);
         pfx->frame = {0.0, 0.0, 2340.0, 1080.0};
+        oh2_objc_mark_immortal(g_main_screen);
     }
     return g_main_screen;
 }
@@ -2067,7 +2096,10 @@ static double imp_uiscreen_scale(void *self, const char *sel) {
 /* UIApplication */
 static void *imp_uiapplication_sharedApplication(DarwinObjCClass *cls, const char *sel) {
     (void)cls; (void)sel;
-    if (!g_shared_application) g_shared_application = alloc_objc_instance(&_OBJC_CLASS_$_UIApplication);
+    if (!g_shared_application) {
+        g_shared_application = alloc_objc_instance(&_OBJC_CLASS_$_UIApplication);
+        oh2_objc_mark_immortal(g_shared_application);
+    }
     return g_shared_application;
 }
 static int64_t imp_uiapplication_statusBarOrientation(void *self, const char *sel) {
@@ -2107,7 +2139,10 @@ static void *imp_uiview_layer(void *self, const char *sel) {
     (void)sel;
     DarwinObjCPrefix *pfx = get_heap_prefix(self);
     if (pfx) {
-        if (!pfx->layer) pfx->layer = alloc_objc_instance(&_OBJC_CLASS_$_CAMetalLayer);
+        if (!pfx->layer) {
+            pfx->layer = alloc_objc_instance(&_OBJC_CLASS_$_CAMetalLayer);
+            oh2_objc_mark_immortal(pfx->layer);
+        }
         return pfx->layer;
     }
     return alloc_objc_instance(&_OBJC_CLASS_$_CAMetalLayer);
@@ -2116,28 +2151,48 @@ static void *imp_uiview_layer(void *self, const char *sel) {
 /* NSProcessInfo */
 static void *imp_nsprocessinfo_processInfo(DarwinObjCClass *cls, const char *sel) {
     (void)cls; (void)sel;
-    if (!g_process_info) g_process_info = alloc_objc_instance(&_OBJC_CLASS_$_NSProcessInfo);
+    if (!g_process_info) {
+        g_process_info = alloc_objc_instance(&_OBJC_CLASS_$_NSProcessInfo);
+        oh2_objc_mark_immortal(g_process_info);
+    }
     return g_process_info;
 }
+struct DarwinOSVersion {
+    int64_t major;
+    int64_t minor;
+    int64_t patch;
+};
 static int64_t imp_nsprocessinfo_thermalState(void *self, const char *sel) {
     (void)self; (void)sel;
     return 0; /* NSProcessInfoThermalStateNominal */
+}
+static DarwinOSVersion imp_nsprocessinfo_operatingSystemVersion(void *self, const char *sel) {
+    (void)self; (void)sel;
+    return {16, 0, 0};
+}
+static uint8_t imp_nsprocessinfo_isAtLeastVersion(void *self, const char *sel, DarwinOSVersion ver) {
+    (void)self; (void)sel;
+    if (16 > ver.major) return 1;
+    if (16 < ver.major) return 0;
+    if (0 > ver.minor) return 1;
+    if (0 < ver.minor) return 0;
+    return (0 >= ver.patch) ? 1 : 0;
 }
 
 /* NSNotificationCenter & UNUserNotificationCenter & AVAudioSession & NSFileManager & NSUserDefaults */
 static void *imp_nsnotif_defaultCenter(DarwinObjCClass *cls, const char *sel) {
     (void)cls; (void)sel;
-    if (!g_notif_center) g_notif_center = alloc_objc_instance(&_OBJC_CLASS_$_NSNotificationCenter);
+    if (!g_notif_center) { g_notif_center = alloc_objc_instance(&_OBJC_CLASS_$_NSNotificationCenter); oh2_objc_mark_immortal(g_notif_center); }
     return g_notif_center;
 }
 static void *imp_unuser_currentNotificationCenter(DarwinObjCClass *cls, const char *sel) {
     (void)cls; (void)sel;
-    if (!g_user_notif_center) g_user_notif_center = alloc_objc_instance(&_OBJC_CLASS_$_UNUserNotificationCenter);
+    if (!g_user_notif_center) { g_user_notif_center = alloc_objc_instance(&_OBJC_CLASS_$_UNUserNotificationCenter); oh2_objc_mark_immortal(g_user_notif_center); }
     return g_user_notif_center;
 }
 static void *imp_avaudiosession_sharedInstance(DarwinObjCClass *cls, const char *sel) {
     (void)cls; (void)sel;
-    if (!g_audio_session) g_audio_session = alloc_objc_instance(&_OBJC_CLASS_$_AVAudioSession);
+    if (!g_audio_session) { g_audio_session = alloc_objc_instance(&_OBJC_CLASS_$_AVAudioSession); oh2_objc_mark_immortal(g_audio_session); }
     return g_audio_session;
 }
 static uint8_t imp_avaudiosession_true(void *self, const char *sel) {
@@ -2150,12 +2205,12 @@ static float imp_avaudiosession_outputVolume(void *self, const char *sel) {
 }
 static void *imp_nsfilemanager_defaultManager(DarwinObjCClass *cls, const char *sel) {
     (void)cls; (void)sel;
-    if (!g_file_manager) g_file_manager = alloc_objc_instance(&_OBJC_CLASS_$_NSFileManager);
+    if (!g_file_manager) { g_file_manager = alloc_objc_instance(&_OBJC_CLASS_$_NSFileManager); oh2_objc_mark_immortal(g_file_manager); }
     return g_file_manager;
 }
 static void *imp_nsuserdefaults_standardUserDefaults(DarwinObjCClass *cls, const char *sel) {
     (void)cls; (void)sel;
-    if (!g_user_defaults) g_user_defaults = alloc_objc_instance(&_OBJC_CLASS_$_NSUserDefaults);
+    if (!g_user_defaults) { g_user_defaults = alloc_objc_instance(&_OBJC_CLASS_$_NSUserDefaults); oh2_objc_mark_immortal(g_user_defaults); }
     return g_user_defaults;
 }
 static void *imp_nstimer_scheduledTimer(DarwinObjCClass *cls, const char *sel,
@@ -2221,6 +2276,13 @@ static void imp_nsmutablearray_addObject(void *self, const char *sel, void *obj)
     if (pfx && obj) {
         if (!pfx->cpp_array) pfx->cpp_array = new std::vector<void *>();
         pfx->cpp_array->push_back(obj);
+    }
+}
+static void imp_nsmutablearray_removeAllObjects(void *self, const char *sel) {
+    (void)sel;
+    DarwinObjCPrefix *pfx = get_heap_prefix(self);
+    if (pfx && pfx->cpp_array) {
+        pfx->cpp_array->clear();
     }
 }
 
@@ -2462,6 +2524,14 @@ static void init_external_objc_classes(void) {
     __NSConcreteStackBlock.cache_buckets = &__objc_empty_cache;
     __NSConcreteStackBlock.data_ptr = (uint64_t)(uintptr_t)&g_stack_block_ro;
 
+    memset(&g_malloc_block_ro, 0, sizeof(DarwinClassRO));
+    g_malloc_block_ro.instanceSize = 32U;
+    g_malloc_block_ro.name = "__NSMallocBlock__";
+    __NSConcreteMallocBlock.isa = &_OBJC_METACLASS_$_NSObject;
+    __NSConcreteMallocBlock.superclass = &_OBJC_CLASS_$_NSObject;
+    __NSConcreteMallocBlock.cache_buckets = &__objc_empty_cache;
+    __NSConcreteMallocBlock.data_ptr = (uint64_t)(uintptr_t)&g_malloc_block_ro;
+
     /* Register core methods on NSObject */
     register_class_method(&_OBJC_CLASS_$_NSObject, "alloc", (void *)&imp_nsobject_alloc);
     register_class_method(&_OBJC_CLASS_$_NSObject, "allocWithZone:", (void *)&imp_nsobject_allocWithZone);
@@ -2543,6 +2613,8 @@ static void init_external_objc_classes(void) {
     /* Register NSProcessInfo, NSNotificationCenter, UNUserNotificationCenter, AVAudioSession, NSTimer, NSThread */
     register_class_method(&_OBJC_CLASS_$_NSProcessInfo, "processInfo", (void *)&imp_nsprocessinfo_processInfo);
     register_instance_method(&_OBJC_CLASS_$_NSProcessInfo, "thermalState", (void *)&imp_nsprocessinfo_thermalState);
+    register_instance_method(&_OBJC_CLASS_$_NSProcessInfo, "operatingSystemVersion", (void *)&imp_nsprocessinfo_operatingSystemVersion);
+    register_instance_method(&_OBJC_CLASS_$_NSProcessInfo, "isOperatingSystemAtLeastVersion:", (void *)&imp_nsprocessinfo_isAtLeastVersion);
     register_class_method(&_OBJC_CLASS_$_NSNotificationCenter, "defaultCenter", (void *)&imp_nsnotif_defaultCenter);
     register_class_method(&_OBJC_CLASS_$_UNUserNotificationCenter, "currentNotificationCenter", (void *)&imp_unuser_currentNotificationCenter);
     register_class_method(&_OBJC_CLASS_$_AVAudioSession, "sharedInstance", (void *)&imp_avaudiosession_sharedInstance);
@@ -2562,12 +2634,14 @@ static void init_external_objc_classes(void) {
     register_instance_method(&_OBJC_CLASS_$_NSArray, "count", (void *)&imp_nsarray_count);
     register_instance_method(&_OBJC_CLASS_$_NSArray, "objectAtIndex:", (void *)&imp_nsarray_objectAtIndex);
     register_instance_method(&_OBJC_CLASS_$_NSMutableArray, "addObject:", (void *)&imp_nsmutablearray_addObject);
+    register_instance_method(&_OBJC_CLASS_$_NSMutableArray, "removeAllObjects", (void *)&imp_nsmutablearray_removeAllObjects);
 
     register_class_method(&_OBJC_CLASS_$_NSDictionary, "dictionary", (void *)&imp_nsdict_dictionary);
     register_instance_method(&_OBJC_CLASS_$_NSDictionary, "objectForKey:", (void *)&imp_nsdict_objectForKey);
     register_instance_method(&_OBJC_CLASS_$_NSMutableDictionary, "setObject:forKey:", (void *)&imp_nsmutabledict_setObjectForKey);
 
     ___NSDictionary0__ = imp_nsdict_dictionary(&_OBJC_CLASS_$_NSDictionary, "dictionary");
+    oh2_objc_mark_immortal(___NSDictionary0__);
 }
 
 } // namespace
@@ -2595,6 +2669,7 @@ extern "C" void oh2_symbol_resolver_init(MachOImage *img) {
     g_symbol_table["___CFConstantStringClassReference"] = (void *)&___CFConstantStringClassReference;
     g_symbol_table["__NSConcreteGlobalBlock"]           = (void *)&__NSConcreteGlobalBlock;
     g_symbol_table["__NSConcreteStackBlock"]            = (void *)&__NSConcreteStackBlock;
+    g_symbol_table["__NSConcreteMallocBlock"]           = (void *)&__NSConcreteMallocBlock;
     g_symbol_table["__objc_empty_cache"]                = (void *)&__objc_empty_cache;
     g_symbol_table["__DefaultRuneLocale"]               = (void *)&__DefaultRuneLocale;
     g_symbol_table["__dispatch_main_q"]                 = (void *)&__dispatch_main_q;
@@ -3147,6 +3222,44 @@ extern "C" void oh2_symbol_register_override(const char *sym_name, void *addr) {
     g_symbol_table[sym_name] = addr;
 }
 
+static DarwinObjCClass *ensure_dynamic_class_locked(const char *cls_name, const char *super_name) {
+    if (!cls_name || !cls_name[0]) return &_OBJC_CLASS_$_NSObject;
+    auto it = g_class_by_name.find(cls_name);
+    if (it != g_class_by_name.end()) return it->second;
+
+    DarwinObjCClass *super_cls = &_OBJC_CLASS_$_NSObject;
+    if (super_name && super_name[0]) {
+        auto sit = g_class_by_name.find(super_name);
+        if (sit != g_class_by_name.end()) super_cls = sit->second;
+    }
+
+    const char *interned_name = intern_selector(cls_name);
+    DarwinClassRO   *ro_meta  = (DarwinClassRO *)calloc(1, sizeof(DarwinClassRO));
+    DarwinClassRO   *ro_cls   = (DarwinClassRO *)calloc(1, sizeof(DarwinClassRO));
+    DarwinObjCClass *meta     = (DarwinObjCClass *)calloc(1, sizeof(DarwinObjCClass));
+    DarwinObjCClass *cls      = (DarwinObjCClass *)calloc(1, sizeof(DarwinObjCClass));
+
+    ro_meta->flags        = 1U;
+    ro_meta->instanceSize = sizeof(DarwinObjCClass);
+    ro_meta->name         = interned_name;
+
+    ro_cls->flags         = 0U;
+    ro_cls->instanceStart = 8U;
+    ro_cls->instanceSize  = 64U;
+    ro_cls->name          = interned_name;
+
+    meta->isa        = &_OBJC_METACLASS_$_NSObject;
+    meta->superclass = (super_cls && super_cls->isa) ? super_cls->isa : &_OBJC_METACLASS_$_NSObject;
+    meta->data_ptr   = (uint64_t)(uintptr_t)ro_meta;
+
+    cls->isa         = meta;
+    cls->superclass  = super_cls;
+    cls->data_ptr    = (uint64_t)(uintptr_t)ro_cls;
+
+    g_class_by_name[interned_name] = cls;
+    return cls;
+}
+
 extern "C" void oh2_objc_register_instance_method(const char *cls_name, const char *sel_name, void *imp) {
     if (!cls_name || !sel_name || !imp) return;
     if (g_symbol_table.empty()) {
@@ -3155,10 +3268,7 @@ extern "C" void oh2_objc_register_instance_method(const char *cls_name, const ch
     DarwinObjCClass *cls = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_objc_mutex);
-        auto it = g_class_by_name.find(cls_name);
-        if (it != g_class_by_name.end()) {
-            cls = it->second;
-        }
+        cls = ensure_dynamic_class_locked(cls_name, "NSObject");
     }
     if (cls) {
         register_instance_method(cls, sel_name, imp);
@@ -3173,14 +3283,29 @@ extern "C" void oh2_objc_register_class_method(const char *cls_name, const char 
     DarwinObjCClass *cls = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_objc_mutex);
-        auto it = g_class_by_name.find(cls_name);
-        if (it != g_class_by_name.end()) {
-            cls = it->second;
-        }
+        cls = ensure_dynamic_class_locked(cls_name, "NSObject");
     }
     if (cls) {
         register_class_method(cls, sel_name, imp);
     }
+}
+
+extern "C" void *oh2_objc_ensure_class(const char *cls_name, const char *super_name) {
+    if (!cls_name) return &_OBJC_CLASS_$_NSObject;
+    if (g_symbol_table.empty()) {
+        oh2_symbol_resolver_init(nullptr);
+    }
+    std::lock_guard<std::mutex> lk(g_objc_mutex);
+    return (void *)ensure_dynamic_class_locked(cls_name, super_name ? super_name : "NSObject");
+}
+
+extern "C" const char *oh2_objc_object_class_name(const void *obj) {
+    if (!obj || !is_valid_class_ptr(obj)) return "";
+    uintptr_t raw_isa = *(const uintptr_t *)obj;
+    if ((raw_isa & 1ULL) != 0) raw_isa &= 0x0000000ffffffff8ULL;
+    const DarwinObjCClass *cls = (const DarwinObjCClass *)raw_isa;
+    if (!is_valid_class_ptr(cls)) return "";
+    return class_get_name_raw(cls);
 }
 
 extern "C" void *oh2_objc_get_class(const char *cls_name) {
@@ -3218,6 +3343,43 @@ extern "C" void *oh2_objc_lookup_super2_imp(void *sup, const char *sel) {
     return darwin_objc_lookup_super2_imp(sup, sel);
 }
 
+extern "C" int oh2_objc_is_block(const void *obj) {
+    if (!obj) return 0;
+    uintptr_t v = (uintptr_t)obj;
+    if (v < 0x10000ULL || (v & 0x7ULL) != 0) return 0;
+    const void *isa = *(void * const *)obj;
+    return (isa == (const void *)&__NSConcreteStackBlock ||
+            isa == (const void *)&__NSConcreteMallocBlock ||
+            isa == (const void *)&__NSConcreteGlobalBlock) ? 1 : 0;
+}
+
+extern "C" void *oh2_objc_get_malloc_block_isa(void) {
+    return (void *)&__NSConcreteMallocBlock;
+}
+
+extern "C" void oh2_objc_register_block_methods(void *copy_imp, void *retain_imp, void *release_imp,
+                                                void *global_retain_imp, void *global_release_imp) {
+    if (copy_imp) {
+        register_instance_method(&__NSConcreteStackBlock,  "copy", copy_imp);
+        register_instance_method(&__NSConcreteMallocBlock, "copy", copy_imp);
+    }
+    if (retain_imp) {
+        register_instance_method(&__NSConcreteStackBlock,  "retain", retain_imp);
+        register_instance_method(&__NSConcreteMallocBlock, "retain", retain_imp);
+    }
+    if (release_imp) {
+        register_instance_method(&__NSConcreteStackBlock,  "release", release_imp);
+        register_instance_method(&__NSConcreteMallocBlock, "release", release_imp);
+    }
+    if (global_retain_imp) {
+        register_instance_method(&__NSConcreteGlobalBlock, "copy",   global_retain_imp);
+        register_instance_method(&__NSConcreteGlobalBlock, "retain", global_retain_imp);
+    }
+    if (global_release_imp) {
+        register_instance_method(&__NSConcreteGlobalBlock, "release", global_release_imp);
+    }
+}
+
 extern "C" int oh2_objc_is_heap_object(const void *obj) {
     return get_heap_prefix(obj) != nullptr ? 1 : 0;
 }
@@ -3231,7 +3393,62 @@ extern "C" int32_t oh2_objc_get_refcount(const void *obj) {
 extern "C" int32_t oh2_objc_add_refcount(void *obj, int32_t delta) {
     DarwinObjCPrefix *pfx = get_heap_prefix(obj);
     if (!pfx) return -1;
+    if (pfx->obj_flags & OH2_OBJC_FLAG_IMMORTAL) {
+        return __atomic_load_n(&pfx->refcount, __ATOMIC_RELAXED);
+    }
     return __atomic_add_fetch(&pfx->refcount, delta, __ATOMIC_RELAXED);
+}
+
+extern "C" void oh2_objc_set_dealloc(void *obj, void (*dealloc_fn)(void *obj)) {
+    DarwinObjCPrefix *pfx = get_heap_prefix(obj);
+    if (pfx) {
+        pfx->custom_dealloc = dealloc_fn;
+    }
+}
+
+extern "C" void oh2_objc_mark_immortal(void *obj) {
+    DarwinObjCPrefix *pfx = get_heap_prefix(obj);
+    if (pfx) {
+        pfx->obj_flags |= OH2_OBJC_FLAG_IMMORTAL;
+    }
+}
+
+extern "C" void oh2_objc_mark_reclaimable(void *obj) {
+    DarwinObjCPrefix *pfx = get_heap_prefix(obj);
+    if (pfx) {
+        pfx->obj_flags |= OH2_OBJC_FLAG_RECLAIMABLE;
+    }
+}
+
+extern "C" void oh2_objc_register_autorelease_hook(void *(*hook)(void *obj)) {
+    g_autorelease_hook = hook;
+}
+
+extern "C" void oh2_objc_release_object(void *obj) {
+    if (!obj) return;
+    if (oh2_objc_is_block(obj)) {
+        typedef void (*brel_t)(const void *);
+        static brel_t fn = (brel_t)darwin_resolve_symbol(nullptr, "__Block_release");
+        if (fn) fn(obj);
+        return;
+    }
+    DarwinObjCPrefix *pfx = get_heap_prefix(obj);
+    if (!pfx || (pfx->obj_flags & OH2_OBJC_FLAG_IMMORTAL)) {
+        return;
+    }
+    int32_t rc = __atomic_sub_fetch(&pfx->refcount, 1, __ATOMIC_ACQ_REL);
+    if (rc == 0 && (pfx->custom_dealloc != nullptr || (pfx->obj_flags & OH2_OBJC_FLAG_RECLAIMABLE) != 0)) {
+        pfx->magic = 0;
+        void (*dealloc_fn)(void *) = pfx->custom_dealloc;
+        pfx->custom_dealloc = nullptr;
+        if (dealloc_fn) {
+            dealloc_fn(obj);
+        }
+        delete pfx->cpp_str;
+        delete pfx->cpp_array;
+        delete pfx->cpp_dict;
+        free(pfx);
+    }
 }
 
 extern "C" void oh2_objc_set_bundle_root(const char *path) {

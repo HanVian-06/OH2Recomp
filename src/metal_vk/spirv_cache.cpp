@@ -157,16 +157,12 @@ struct LoadedSpirvCache {
 
 static LoadedSpirvCache g_cache;
 
-} // namespace
-
-extern "C" {
-
-uint64_t spirv_cache_hash_mtlb(const void* mtlb_data, size_t size) {
-    if (!mtlb_data || size == 0) {
-        return 0;
+static const uint8_t* find_mtlb_magic(const void* data, size_t size, size_t* out_len) {
+    if (!data || size == 0) {
+        if (out_len) *out_len = 0;
+        return nullptr;
     }
-    /* If caller passed full UE4 entry (FMetalCodeHeader + MTLB), advance to 'MTLB' magic */
-    const uint8_t* ptr = static_cast<const uint8_t*>(mtlb_data);
+    const uint8_t* ptr = static_cast<const uint8_t*>(data);
     size_t len = size;
     if (len >= 4 && !(ptr[0] == 'M' && ptr[1] == 'T' && ptr[2] == 'L' && ptr[3] == 'B')) {
         for (size_t i = 0; i + 4 <= len; ++i) {
@@ -177,13 +173,40 @@ uint64_t spirv_cache_hash_mtlb(const void* mtlb_data, size_t size) {
             }
         }
     }
+    if (out_len) *out_len = len;
+    return ptr;
+}
+
+static uint64_t hash_bytes_sha256_u64(const uint8_t* data, size_t len) {
     uint8_t digest[32];
-    sha256_compute(ptr, len, digest);
+    sha256_compute(data, len, digest);
     uint64_t id = 0;
     for (int i = 0; i < 8; ++i) {
         id |= static_cast<uint64_t>(digest[i]) << (i * 8);
     }
     return id;
+}
+
+static uint64_t hash_mtlb_with_trailer(const uint8_t* ptr, size_t len) {
+    if (!ptr || len == 0) return 0;
+    static const uint8_t kTrailer[4] = {0x04u, 0x00u, 0x00u, 0x00u};
+    std::vector<uint8_t> buf(len + sizeof(kTrailer));
+    std::memcpy(buf.data(), ptr, len);
+    std::memcpy(buf.data() + len, kTrailer, sizeof(kTrailer));
+    return hash_bytes_sha256_u64(buf.data(), buf.size());
+}
+
+} // namespace
+
+extern "C" {
+
+uint64_t spirv_cache_hash_mtlb(const void* mtlb_data, size_t size) {
+    size_t len = 0;
+    const uint8_t* ptr = find_mtlb_magic(mtlb_data, size, &len);
+    if (!ptr || len == 0) {
+        return 0;
+    }
+    return hash_bytes_sha256_u64(ptr, len);
 }
 
 void spirv_cache_unload(void) {
@@ -349,7 +372,34 @@ const SpirvShaderEntry* spirv_cache_find(uint64_t shader_hash_or_id) {
 
 const SpirvShaderEntry* spirv_cache_find_by_mtlb(const void* mtlb_data, size_t size) {
     uint64_t id = spirv_cache_hash_mtlb(mtlb_data, size);
-    return spirv_cache_find(id);
+    const SpirvShaderEntry* entry = spirv_cache_find(id);
+    if (entry) {
+        return entry;
+    }
+
+    size_t len = 0;
+    const uint8_t* ptr = find_mtlb_magic(mtlb_data, size, &len);
+    if (!ptr || len < 4 || ptr[0] != 'M' || ptr[1] != 'T' || ptr[2] != 'L' || ptr[3] != 'B') {
+        return nullptr;
+    }
+
+    /* tools/air2spirv/cli.py hashed MTLB plus UE4's 4-byte trailing marker (04 00 00 00). */
+    entry = spirv_cache_find(hash_mtlb_with_trailer(ptr, len));
+    if (entry) {
+        return entry;
+    }
+
+    if (len >= 24) {
+        uint64_t total_sz = 0;
+        std::memcpy(&total_sz, ptr + 16, sizeof(total_sz));
+        if (total_sz >= 88 && total_sz <= len && total_sz != len) {
+            entry = spirv_cache_find(hash_mtlb_with_trailer(ptr, static_cast<size_t>(total_sz)));
+            if (entry) {
+                return entry;
+            }
+        }
+    }
+    return nullptr;
 }
 
 const SpirvShaderEntry* spirv_cache_find_by_pak_sha1(const uint8_t pak_sha1[20]) {
@@ -374,6 +424,13 @@ const SpirvShaderEntry* spirv_cache_find_by_entry_name(const char* entry_name) {
         }
     }
     return nullptr;
+}
+
+const SpirvShaderEntry* spirv_cache_entry_at(uint32_t index) {
+    if (index >= g_cache.runtime_entries.size()) {
+        return nullptr;
+    }
+    return &g_cache.runtime_entries[index];
 }
 
 uint32_t spirv_cache_count(void) {

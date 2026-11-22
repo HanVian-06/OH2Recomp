@@ -45,6 +45,12 @@ struct VkCapabilities {
 
     VkDeviceSize optimal_buffer_copy_offset_alignment = 1;
     VkDeviceSize non_coherent_atom_size = 128;
+    float max_sampler_anisotropy = 1.0f;
+
+    VkPhysicalDeviceFeatures supported_features{};
+    bool d32_sfloat_supported = false;
+    bool d32_sfloat_s8_supported = false;
+    bool compute_queue_supported = false;
 };
 
 struct Vertex {

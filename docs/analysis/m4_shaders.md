@@ -121,16 +121,16 @@ Across all `4,482` unique `MTLB` bitcode streams (`1,487,206` main-function SSA 
 ---
 
 ## 4. `SPVC` v1 `spirv_cache.bin` Binary Layout & C/C++ Loader (`src/metal_vk/spirv_cache.{h,cpp}`)
-Generated at `build/shaders/spirv_cache.bin` (`69,057,232` bytes total):
+Generated at `build/shaders/spirv_cache.bin` (`69,090,604` bytes total):
 
 | Section | Offset | Size (Bytes) | Alignment | Record Layout |
 |---|---:|---:|---:|---|
-| `SpirvCacheHeader` | `0` | `80` | `8` B | `magic = 0x43565053 ('SPVC')`, `version = 1`, `flags = 1`, `entry_count = 4,482`, section offsets, `total_file_size = 69,057,232`, `total_translated = 4,544`, `total_spirv_val_passed = 4,544` |
+| `SpirvCacheHeader` | `0` | `80` | `8` B | `magic = 0x43565053 ('SPVC')`, `version = 1`, `flags = 1`, `entry_count = 4,482`, section offsets, `total_file_size = 69,090,604`, `total_translated = 4,544`, `total_spirv_val_passed = 4,544` |
 | `SpirvCacheDiskEntry[4482]` | `80` | `501,984` | `8` B | `4,482` × `112` B sorted ascending by `uint64_t shader_id = le64(SHA-256(mtlb_bytes)[0:8])` for `O(log N)` binary search (`pak_sha1[20]`, `mtlb_sha256[32]`, `stage`, `spirv_offset`, `spirv_size_bytes`, masks, reflection slices, workgroup local size) |
-| `SpirvBindingDesc[52989]` | `502,064` | `635,868` | `4` B | `52,989` × `12` B (`set`, `binding`, `descriptor_type`, `metal_slot`, `metal_kind`, `image_dim`, `is_depth`, `flags`, `buffer_size_bytes`) |
-| `SpirvVertexAttrDesc[7588]` | `1,137,932` | `60,704` | `4` B | `7,588` × `8` B (`location`, `component_type`, `components`, `flags`, `name_offset`) |
-| `StringTable` | `1,198,636` | `103,824` | `4` B | NUL-terminated UTF-8 Metal function names (`Main_0000XXXX_YYYYYYYY`) and vertex attribute names |
-| `SpirvWordBlob` | `1,302,460` | `67,754,772` | `4` B | Concatenated 4-byte aligned SPIR-V 1.3 binary modules (`16,938,693` words) |
+| `SpirvBindingDesc[53188]` | `502,064` | `638,256` | `4` B | `53,188` × `12` B (`set`, `binding`, `descriptor_type`, `metal_slot`, `metal_kind`, `image_dim`, `is_depth`, `flags`, `buffer_size_bytes`) |
+| `SpirvVertexAttrDesc[7588]` | `1,140,320` | `60,704` | `4` B | `7,588` × `8` B (`location`, `component_type`, `components`, `flags`, `name_offset`) |
+| `StringTable` | `1,201,024` | `103,824` | `4` B | NUL-terminated UTF-8 Metal function names (`Main_0000XXXX_YYYYYYYY`) and vertex attribute names |
+| `SpirvWordBlob` | `1,304,848` | `67,785,756` | `4` B | Concatenated 4-byte aligned SPIR-V 1.3 binary modules (`16,946,439` words) |
 
 Runtime C/C++ interface (`src/metal_vk/spirv_cache.h`, `src/metal_vk/spirv_cache.cpp`, verified with Android NDK r28c `aarch64-linux-android29-clang++ -Wall -Wextra -Werror`):
 - `bool spirv_cache_load(const char* cache_path);` (zero-copy `mmap` on Android/POSIX with `fread` fallback)
@@ -155,4 +155,4 @@ Repeatable gate execution:
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/gate_m4.ps1
 ```
-Output: `M4_STATS: total=4544 unique_mtlb=4482 translated=4544 spirv_val_passed=4544 unique_passed=4482 pass_rate=100.00% cache_bytes=69057232` -> `GATE M4: PASS` (exit `0`).
+Output: `M4_STATS: total=4544 unique_mtlb=4482 translated=4544 spirv_val_passed=4544 unique_passed=4482 pass_rate=100.00% cache_bytes=69090604` -> `GATE M4: PASS` (exit `0`).
