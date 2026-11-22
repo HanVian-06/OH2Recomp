@@ -1,0 +1,30 @@
+# Read-only original iOS IPA payload (2.32 GB)
+Payload/
+
+# Build & Gradle outputs
+build/
+.gradle/
+android/**/build/
+android/**/.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Python & IDE
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.idea/
+.vscode/
+
+# Temp & logs
+*.tmp
+*.temp
+*.log
+local.properties
+
+# Downloaded archives (keep extracted verified libs if committed, ignore raw zips/aars)
+third_party/**/*.zip
+third_party/**/*.aar
