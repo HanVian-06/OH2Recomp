@@ -6,10 +6,13 @@ build/
 .gradle/
 android/**/build/
 android/**/.cxx/
+android/**/assets/shaders/
 *.apk
 *.aab
 *.ap_
 *.dex
+*.spv
+spirv_cache.bin
 
 # Python & IDE
 __pycache__/
