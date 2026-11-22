@@ -26,3 +26,16 @@
 - **Documentation Precision**:
   - `docs/analysis/pak_textures_audio.md`: Updated `.pak` uncompressed payload total (`4,454,021,592` B / `4,247.69 MB`), compressed payload total (`2,407,384,060` B), and `.png/.res/.psd/.locres/.ini/other` row (`2,247,305` B compressed, `5,016,980` B uncompressed) to match `inspect_shaders_pak.py --json`.
   - `docs/analysis/macho_binary.md`: Updated UE4 build tag string on line 5 to `++UE4+Release-4.23 May 22 2020 +`.
+
+
+## 2026-11-22 — M3 Standalone Vulkan 1.1 Graphics Foundation (`M3_GRAPHICS_FOUNDATION`)
+- **Vulkan 1.1 Core & VMA Foundation (`src/vk_foundation/`, `third_party/vma/`)**:
+  - Integrated Vulkan Memory Allocator `v3.5.0` (`third_party/vma/vk_mem_alloc.h`) with Vulkan 1.1 dynamic function pointers (`VMA_VULKAN_VERSION=1001000`).
+  - Implemented `oh2::vk::VkContext` (`src/vk_foundation/src/vk_context.cpp`): Vulkan 1.1 instance with `VK_LAYER_KHRONOS_validation` and `VK_EXT_debug_utils`, physical device and queue selection on `ANativeWindow`, runtime feature detection via `vkGetPhysicalDeviceFeatures2` (`VK_KHR_dynamic_rendering`, `VK_EXT_descriptor_indexing`, and native ASTC 4x4/6x6/8x8 LDR format properties), and sRGB-aware swapchain creation.
+  - Implemented `oh2::vk::StagingRingBuffer` (`src/vk_foundation/src/staging_ring.cpp`): persistent mapped 64 MiB VMA staging ring-buffer with contiguous tail wrap-around, `nonCoherentAtomSize` flush alignment, and `VkFence`-tracked span reclamation (verified via 128 MiB GPU transfer self-test with 2 wrap-arounds and 9 fence reclaims).
+  - Implemented `oh2::vk::AstcTexture` (`src/vk_foundation/src/astc_texture.cpp`): direct staging-ring-to-`VkImage` upload (`VK_FORMAT_ASTC_4x4_UNORM_BLOCK`) with zero CPU-side RGBA8 decompression.
+  - Implemented `oh2::vk::M3Renderer` (`src/vk_foundation/src/m3_renderer.cpp`) and Vulkan 1.1 shaders (`src/vk_foundation/shaders/triangle.{vert,frag}`): dual render paths (`VkRenderPass` fallback + `VK_KHR_dynamic_rendering` both verified at runtime), negative-viewport Y-flip (`y=H, height=-H`) with CCW front-face winding and back-face culling, and 7-stage automated self-test logging.
+- **Android Sandbox & Repeatable Gate (`android/m3_vk_sandbox/`, `scripts/m3/`, `scripts/gate_m3.ps1`)**:
+  - Created `android/m3_vk_sandbox` (`com.oceanhorn2.port.m3vulkan`), offline APK builder `scripts/m3/build_apk.ps1` (`glslc` + `spirv-val` + CMake/Ninja NDK r28c + `aapt2` + `ZIP_STORED` native libs + `zipalign` + `apksigner`), pixel verifier `scripts/m3/verify_screencap.py`, and gate `scripts/gate_m3.ps1`.
+  - Verified on Samsung Galaxy A56 (`RRCY40086KE`, `Samsung Xclipse 540`): all 7 `[M3_PASS]` checks passed, `validation_errors=0 validation_warnings=0`, screenshot `2340x1080` verified (`clear_ratio=0.784`, `tri_ratio=0.216`, upright Y-flip `lower/upper=3.03x`), `scripts/gate_m3.ps1` exited `0` (`GATE M3: PASS`).
+  - Documented architecture and device verification results in `docs/analysis/m3_vulkan.md`.
