@@ -32,14 +32,19 @@ if ($env:VULKAN_SDK) {
     }
 }
 
-$CurrentParts = @($env:PATH -split ';' | Where-Object { $_ -and $_.Trim() -ne '' })
+$CurrentParts = @(
+    $env:PATH -split ';' |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -ne '' }
+)
 $ToPrepend = @()
 
 foreach ($Dir in $RequiredPathDirs) {
     if (Test-Path $Dir) {
+        $NormDir = $Dir.Trim().TrimEnd('\')
         $AlreadyPresent = $false
         foreach ($Existing in $CurrentParts) {
-            if ($Existing.TrimEnd('\') -ieq $Dir.TrimEnd('\')) {
+            if ($Existing.Trim().TrimEnd('\') -ieq $NormDir) {
                 $AlreadyPresent = $true
                 break
             }

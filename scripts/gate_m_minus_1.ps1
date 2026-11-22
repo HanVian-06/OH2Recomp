@@ -25,6 +25,24 @@ if (-not (Test-Path $ValSo)) {
     exit 1
 }
 
-Write-Host "[PASS] Gate M-1: Validation layer present ($((Get-Item $ValSo).Length) bytes)" -ForegroundColor Green
+$ValItem = Get-Item $ValSo
+if ($ValItem.Length -le 0) {
+    Write-Host "[FAIL] Gate M-1: validation layer is 0 bytes ($ValSo)" -ForegroundColor Red
+    exit 1
+}
+
+$ElfMagic = New-Object byte[] 4
+$Fs = [System.IO.File]::OpenRead($ValSo)
+try {
+    $BytesRead = $Fs.Read($ElfMagic, 0, 4)
+} finally {
+    $Fs.Dispose()
+}
+if ($BytesRead -lt 4 -or $ElfMagic[0] -ne 0x7F -or $ElfMagic[1] -ne 0x45 -or $ElfMagic[2] -ne 0x4C -or $ElfMagic[3] -ne 0x46) {
+    Write-Host "[FAIL] Gate M-1: invalid ELF header in $ValSo" -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "[PASS] Gate M-1: Validation layer present ($($ValItem.Length) bytes, valid ELF)" -ForegroundColor Green
 Write-Host "GATE M-1: PASS" -ForegroundColor Green
 exit 0

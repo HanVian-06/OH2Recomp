@@ -10,6 +10,7 @@ Repeatable Gate M0:
 """
 
 import os
+import re
 import struct
 import sys
 
@@ -29,18 +30,64 @@ REQUIRED_DOCS = [
     "docs/analysis/toolchain_device.md",
 ]
 
-REQUIRED_METRICS = [
-    ("docs/analysis/macho_binary.md", ["53,729,072", "520,119", "805", "cryptid == 0"]),
-    ("docs/analysis/objc_metadata.md", ["60", "1,491", "192", "134", "52"]),
-    ("docs/analysis/shaders_air.md", ["4,544", "MTLB", "0 / 4,544"]),
-    ("docs/analysis/pak_textures_audio.md", ["19,920", "PF_ASTC_8x8", "PF_ASTC_4x4"]),
-    ("docs/analysis/toolchain_device.md", ["SM-A566B", "Samsung Xclipse 540"]),
+REQUIRED_METRICS: list[tuple[str, list[tuple[str, str]]]] = [
+    (
+        "docs/analysis/macho_binary.md",
+        [
+            ("53,729,072", r"(?<!\d)53,729,072(?!\d)"),
+            ("520,119", r"(?<!\d)520,119(?!\d)"),
+            ("805 undefined", r"(?<!\d)`?805`?\s+undefined\b"),
+            ("cryptid == 0", r"cryptid\s*==\s*0"),
+        ],
+    ),
+    (
+        "docs/analysis/objc_metadata.md",
+        [
+            ("60 classes", r"(?<!\d)`?60`?\s+classes\b"),
+            ("1,491 selectors", r"(?<!\d)`?1,491`?\s+selectors\b"),
+            ("192 classrefs", r"(?<!\d)`?192`?\s+classrefs\b"),
+            ("134 external", r"(?<!\d)`?134`?\s+external\b"),
+            ("52 superrefs", r"(?<!\d)`?52`?\s+superrefs\b"),
+        ],
+    ),
+    (
+        "docs/analysis/shaders_air.md",
+        [
+            ("4,544 shaders", r"(?<!\d)`?4,544`?\s+[Ss]haders\b"),
+            ("MTLB", r"\bMTLB\b"),
+            ("0 / 4,544", r"(?<!\d)0\s*/\s*4,544(?!\d)"),
+        ],
+    ),
+    (
+        "docs/analysis/pak_textures_audio.md",
+        [
+            ("19,920", r"(?<!\d)19,920(?!\d)"),
+            ("PF_ASTC_8x8", r"\bPF_ASTC_8x8\b"),
+            ("PF_ASTC_4x4", r"\bPF_ASTC_4x4\b"),
+            ("4,454,021,592", r"(?<!\d)4,454,021,592(?!\d)"),
+            ("2,407,384,060", r"(?<!\d)2,407,384,060(?!\d)"),
+        ],
+    ),
+    (
+        "docs/analysis/toolchain_device.md",
+        [
+            ("SM-A566B", r"\bSM-A566B\b"),
+            ("Samsung Xclipse 540", r"\bSamsung Xclipse 540\b"),
+        ],
+    ),
 ]
+
+NEGATED_CRYPTID_LINE_RE = re.compile(
+    r"(?i)(?:\b(?:false|fail(?:ed)?|not|never|invalid|broken|warning)\b|!=\s*0)"
+)
 
 
 def check_macho_cryptid(binary_path: str) -> tuple[bool, str]:
     if not os.path.isfile(binary_path):
         return False, f"Binary not found: {binary_path}"
+    file_size = os.path.getsize(binary_path)
+    if file_size < 32:
+        return False, "File too small for mach_header_64"
     with open(binary_path, "rb") as f:
         header = f.read(32)
         if len(header) < 32:
@@ -48,14 +95,24 @@ def check_macho_cryptid(binary_path: str) -> tuple[bool, str]:
         magic, _, _, _, ncmds, sizeofcmds, _, _ = struct.unpack_from("<8I", header, 0)
         if magic != 0xFEEDFACF:
             return False, f"Unexpected Mach-O magic 0x{magic:08x} (expected 0xfeedfacf)"
+        if sizeofcmds > file_size - 32:
+            return False, f"Invalid Mach-O sizeofcmds ({sizeofcmds}) exceeds file size"
+        if ncmds == 0 or ncmds * 8 > sizeofcmds:
+            return False, f"Invalid Mach-O ncmds={ncmds} for sizeofcmds={sizeofcmds}"
         cmds_blob = f.read(sizeofcmds)
+        if len(cmds_blob) < sizeofcmds:
+            return False, "Truncated Mach-O load commands"
 
     off = 0
     for idx in range(ncmds):
         if off + 8 > len(cmds_blob):
             return False, "Truncated Mach-O load commands"
         cmd, cmdsize = struct.unpack_from("<II", cmds_blob, off)
+        if cmdsize < 8 or off + cmdsize > len(cmds_blob):
+            return False, f"Malformed Mach-O load command {idx} (cmd=0x{cmd:x}, cmdsize={cmdsize})"
         if cmd in (0x21, 0x2C):  # LC_ENCRYPTION_INFO / LC_ENCRYPTION_INFO_64
+            if cmdsize < 20 or off + 20 > len(cmds_blob):
+                return False, f"Truncated LC_ENCRYPTION_INFO(_64) load command (cmdsize={cmdsize})"
             cryptoff, cryptsize, cryptid = struct.unpack_from("<III", cmds_blob, off + 8)
             if cryptid != 0:
                 return (
@@ -78,23 +135,39 @@ def check_docs() -> list[tuple[str, bool, str]]:
         full = os.path.join(REPO_ROOT, rel.replace("/", os.sep))
         if not os.path.isfile(full):
             results.append((f"Doc exists: {rel}", False, "MISSING"))
-        elif os.path.getsize(full) == 0:
-            results.append((f"Doc non-empty: {rel}", False, "EMPTY"))
+            continue
+        with open(full, "r", encoding="utf-8") as f:
+            raw_text = f.read()
+        stripped_comments = re.sub(r"<!--.*?-->", "", raw_text, flags=re.DOTALL)
+        if not raw_text.strip() or not stripped_comments.strip():
+            results.append((f"Doc non-empty: {rel}", False, "EMPTY_OR_WHITESPACE"))
         else:
             results.append((f"Doc exists: {rel}", True, f"{os.path.getsize(full):,} bytes"))
 
-    for rel, needles in REQUIRED_METRICS:
+    for rel, patterns in REQUIRED_METRICS:
         full = os.path.join(REPO_ROOT, rel.replace("/", os.sep))
         if not os.path.isfile(full):
             results.append((f"Metrics in {rel}", False, "file missing"))
             continue
         with open(full, "r", encoding="utf-8") as f:
             text = f.read()
-        missing = [n for n in needles if n not in text]
+        cleaned = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+        missing = []
+        for label, pat in patterns:
+            if label == "cryptid == 0":
+                valid_line = any(
+                    re.search(pat, line) and not NEGATED_CRYPTID_LINE_RE.search(line)
+                    for line in cleaned.splitlines()
+                )
+                if not valid_line:
+                    missing.append(label)
+            elif not re.search(pat, cleaned):
+                missing.append(label)
         if missing:
-            results.append((f"Metrics in {rel}", False, f"Missing tokens: {missing}"))
+            results.append((f"Metrics in {rel}", False, f"Missing/invalid metrics: {missing}"))
         else:
-            results.append((f"Metrics in {rel}", True, f"Verified {needles}"))
+            labels = [label for label, _ in patterns]
+            results.append((f"Metrics in {rel}", True, f"Verified {labels}"))
     return results
 
 

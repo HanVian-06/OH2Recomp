@@ -124,12 +124,16 @@ Test-Check "ADB Galaxy A56 (SM-A566B / RRCY40086KE)" {
         ($_ -match '\bdevice\b') -and (($_ -match 'SM_A566B') -or ($_ -match 'RRCY40086KE') -or ($_ -match 'a56x'))
     })
     if ($Match.Count -gt 0) {
-        $Model = (& $Adb.Source shell getprop ro.product.model 2>&1 | Out-String).Trim()
-        $Sdk = (& $Adb.Source shell getprop ro.build.version.sdk 2>&1 | Out-String).Trim()
+        $Serial = ($Match[0].Trim() -split '\s+')[0]
+        if (-not $Serial) {
+            return @{ Ok = $false; Detail = "Failed to parse device serial from '$($Match[0].Trim())'" }
+        }
+        $Model = (& $Adb.Source -s $Serial shell getprop ro.product.model 2>&1 | Out-String).Trim()
+        $Sdk = (& $Adb.Source -s $Serial shell getprop ro.build.version.sdk 2>&1 | Out-String).Trim()
         if ($Model -eq 'SM-A566B') {
             return @{ Ok = $true; Detail = "Online ($Model, API $Sdk) [$($Match[0].Trim())]" }
         }
-        return @{ Ok = $false; Detail = "Connected device model '$Model' != 'SM-A566B'" }
+        return @{ Ok = $false; Detail = "Connected device model '$Model' != 'SM-A566B' (serial=$Serial)" }
     }
     return @{ Ok = $false; Detail = "Galaxy A56 not connected/authorized in 'adb devices -l'" }
 }

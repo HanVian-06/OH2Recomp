@@ -179,16 +179,10 @@ def count_export_trie(trie: bytes) -> list[str]:
     exports = []
 
     def walk(offset: int, prefix: str) -> None:
-        term_size, pos = read_uleb128(trie, offset)
-        if term_size != 0:
+        term_size, p = read_uleb128(trie, offset)
+        if term_size > 0:
             exports.append(prefix)
-            pos += term_size
-        else:
-            pass
-        # Re-read properly: node = uleb128(terminal_size), [terminal_info], uint8 num_children, children...
-        t_size, p = read_uleb128(trie, offset)
-        if t_size > 0:
-            p += t_size
+            p += term_size
         num_children = trie[p]
         p += 1
         for _ in range(num_children):
