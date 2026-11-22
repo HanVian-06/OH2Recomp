@@ -38,8 +38,22 @@ static inline void darwin_to_aapcs64_va_list(char *darwin_ap, va_list *out_va) {
     memcpy(out_va, &v, sizeof(v));
 }
 
+static oh2_open_handler_t g_open_handler = NULL;
+static oh2_ue4_log_hook_t g_log_hook = NULL;
+
+void oh2_variadic_set_open_handler(oh2_open_handler_t fn) {
+    g_open_handler = fn;
+}
+
+void oh2_variadic_set_log_hook(oh2_ue4_log_hook_t fn) {
+    g_log_hook = fn;
+}
+
 static void mirror_ue4_log(const char *msg) {
     if (!msg || !msg[0]) return;
+    if (g_log_hook) {
+        g_log_hook(msg);
+    }
     __android_log_print(ANDROID_LOG_INFO, "OH2_UE4", "%s", msg);
     fprintf(stdout, "[OH2_UE4] %s\n", msg);
     fflush(stdout);
@@ -196,6 +210,9 @@ static int translate_darwin_open_flags(int d_flags) {
 }
 
 int darwin_open_impl(const char *path, int d_flags, char *darwin_sp) {
+    if (g_open_handler) {
+        return g_open_handler(path, d_flags, darwin_sp);
+    }
     int l_flags = translate_darwin_open_flags(d_flags);
     mode_t mode = 0666;
     if ((d_flags & 0x00000200) && darwin_sp) {

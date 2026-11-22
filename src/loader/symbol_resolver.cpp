@@ -417,7 +417,9 @@ static uint64_t darwin_objc_fallback_imp(void *self, const char *sel) {
 } // namespace
 
 extern "C" const char *darwin_cfstring_utf8(const void *cfstr_obj, char *scratch, size_t scratch_size) {
-    if (!cfstr_obj) return "(null)";
+    if (!cfstr_obj || (uintptr_t)cfstr_obj < 0x10000ULL || ((uintptr_t)cfstr_obj & 0x7ULL) != 0) {
+        return "(null)";
+    }
     const DarwinObjCPrefix *pfx = get_heap_prefix(cfstr_obj);
     if (pfx && pfx->cpp_str) {
         return pfx->cpp_str->c_str();
@@ -507,7 +509,8 @@ extern "C" void *darwin_objc_lookup_imp(void *self, const char *sel) {
     return lookup_imp_from_class(cls, sel);
 }
 
-extern "C" void *darwin_objc_lookup_super2_imp(DarwinObjCSuper *sup, const char *sel) {
+extern "C" void *darwin_objc_lookup_super2_imp(void *sup_raw, const char *sel) {
+    DarwinObjCSuper *sup = (DarwinObjCSuper *)sup_raw;
     if (!sup || !sup->receiver || !sup->current_class || !sel) {
         return (void *)&darwin_objc_fallback_imp;
     }
@@ -1973,6 +1976,8 @@ extern "C" void darwin_objc_appendFormat_impl(void *self, const char *sel, const
 
 namespace {
 
+static std::string g_bundle_root = "/data/local/tmp/OH2.app";
+
 /* NSBundle */
 static void *imp_nsbundle_mainBundle(DarwinObjCClass *cls, const char *sel) {
     (void)cls; (void)sel;
@@ -1983,11 +1988,11 @@ static void *imp_nsbundle_mainBundle(DarwinObjCClass *cls, const char *sel) {
 }
 static void *imp_nsbundle_bundlePath(void *self, const char *sel) {
     (void)self; (void)sel;
-    return create_darwin_cfstring_cstr("/data/local/tmp/OH2.app");
+    return create_darwin_cfstring_cstr(g_bundle_root.c_str());
 }
 static void *imp_nsbundle_resourcePath(void *self, const char *sel) {
     (void)self; (void)sel;
-    return create_darwin_cfstring_cstr("/data/local/tmp/OH2.app");
+    return create_darwin_cfstring_cstr(g_bundle_root.c_str());
 }
 static void *imp_nsbundle_executablePath(void *self, const char *sel) {
     (void)self; (void)sel;
@@ -3128,4 +3133,166 @@ extern "C" int oh2_objc_register_image(MachOImage *img) {
                  img->objc_selref_count,
                  img->cfstring_count);
     return 0;
+}
+
+/* ============================================================================
+ * 8. M2 Extension Hooks (non-breaking C API exported from oh2_loader)
+ * ============================================================================ */
+
+extern "C" void oh2_symbol_register_override(const char *sym_name, void *addr) {
+    if (!sym_name) return;
+    if (g_symbol_table.empty()) {
+        oh2_symbol_resolver_init(nullptr);
+    }
+    g_symbol_table[sym_name] = addr;
+}
+
+extern "C" void oh2_objc_register_instance_method(const char *cls_name, const char *sel_name, void *imp) {
+    if (!cls_name || !sel_name || !imp) return;
+    if (g_symbol_table.empty()) {
+        oh2_symbol_resolver_init(nullptr);
+    }
+    DarwinObjCClass *cls = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_objc_mutex);
+        auto it = g_class_by_name.find(cls_name);
+        if (it != g_class_by_name.end()) {
+            cls = it->second;
+        }
+    }
+    if (cls) {
+        register_instance_method(cls, sel_name, imp);
+    }
+}
+
+extern "C" void oh2_objc_register_class_method(const char *cls_name, const char *sel_name, void *imp) {
+    if (!cls_name || !sel_name || !imp) return;
+    if (g_symbol_table.empty()) {
+        oh2_symbol_resolver_init(nullptr);
+    }
+    DarwinObjCClass *cls = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_objc_mutex);
+        auto it = g_class_by_name.find(cls_name);
+        if (it != g_class_by_name.end()) {
+            cls = it->second;
+        }
+    }
+    if (cls) {
+        register_class_method(cls, sel_name, imp);
+    }
+}
+
+extern "C" void *oh2_objc_get_class(const char *cls_name) {
+    if (!cls_name) return nullptr;
+    if (g_symbol_table.empty()) {
+        oh2_symbol_resolver_init(nullptr);
+    }
+    std::lock_guard<std::mutex> lk(g_objc_mutex);
+    auto it = g_class_by_name.find(cls_name);
+    return (it != g_class_by_name.end()) ? (void *)it->second : nullptr;
+}
+
+extern "C" void *oh2_objc_alloc_instance(void *cls, size_t extra_bytes) {
+    return alloc_objc_instance((DarwinObjCClass *)cls, extra_bytes);
+}
+
+extern "C" void *oh2_objc_create_string(const char *utf8) {
+    return (void *)create_darwin_cfstring_cstr(utf8);
+}
+
+extern "C" void *oh2_objc_create_string_len(const char *utf8, size_t len) {
+    return (void *)create_darwin_cfstring(utf8, len);
+}
+
+extern "C" const char *oh2_objc_intern_selector(const char *sel_name) {
+    std::lock_guard<std::mutex> lk(g_objc_mutex);
+    return intern_selector(sel_name);
+}
+
+extern "C" void *oh2_objc_lookup_imp(void *self, const char *sel) {
+    return darwin_objc_lookup_imp(self, sel);
+}
+
+extern "C" void *oh2_objc_lookup_super2_imp(void *sup, const char *sel) {
+    return darwin_objc_lookup_super2_imp(sup, sel);
+}
+
+extern "C" int oh2_objc_is_heap_object(const void *obj) {
+    return get_heap_prefix(obj) != nullptr ? 1 : 0;
+}
+
+extern "C" int32_t oh2_objc_get_refcount(const void *obj) {
+    const DarwinObjCPrefix *pfx = get_heap_prefix(obj);
+    if (!pfx) return -1;
+    return __atomic_load_n(&pfx->refcount, __ATOMIC_RELAXED);
+}
+
+extern "C" int32_t oh2_objc_add_refcount(void *obj, int32_t delta) {
+    DarwinObjCPrefix *pfx = get_heap_prefix(obj);
+    if (!pfx) return -1;
+    return __atomic_add_fetch(&pfx->refcount, delta, __ATOMIC_RELAXED);
+}
+
+extern "C" void oh2_objc_set_bundle_root(const char *path) {
+    if (path && path[0]) {
+        g_bundle_root = path;
+    }
+}
+
+extern "C" const char *oh2_objc_get_bundle_root(void) {
+    return g_bundle_root.c_str();
+}
+
+extern "C" void *oh2_objc_array_create(const void **items, size_t count) {
+    return darwin_CFArrayCreate(nullptr, items, (int64_t)count, nullptr);
+}
+
+extern "C" void oh2_objc_array_add(void *arr, void *item) {
+    imp_nsmutablearray_addObject(arr, "addObject:", item);
+}
+
+extern "C" size_t oh2_objc_array_count(const void *arr) {
+    int64_t c = darwin_CFArrayGetCount(arr);
+    return c > 0 ? (size_t)c : 0;
+}
+
+extern "C" void *oh2_objc_array_get(const void *arr, size_t idx) {
+    return const_cast<void *>(darwin_CFArrayGetValueAtIndex(arr, (int64_t)idx));
+}
+
+extern "C" void *oh2_objc_dict_create(void) {
+    return imp_nsdict_dictionary(&_OBJC_CLASS_$_NSMutableDictionary, "dictionary");
+}
+
+extern "C" void oh2_objc_dict_set(void *dict, const char *key, void *val) {
+    DarwinObjCPrefix *pfx = get_heap_prefix(dict);
+    if (!pfx || !key || !val) return;
+    if (!pfx->cpp_dict) pfx->cpp_dict = new std::unordered_map<std::string, void *>();
+    (*pfx->cpp_dict)[key] = val;
+}
+
+extern "C" void *oh2_objc_dict_get(const void *dict, const char *key) {
+    const DarwinObjCPrefix *pfx = get_heap_prefix(dict);
+    if (!pfx || !pfx->cpp_dict || !key) return nullptr;
+    auto it = pfx->cpp_dict->find(key);
+    return (it != pfx->cpp_dict->end()) ? it->second : nullptr;
+}
+
+extern "C" size_t oh2_objc_dict_count(const void *dict) {
+    const DarwinObjCPrefix *pfx = get_heap_prefix(dict);
+    return (pfx && pfx->cpp_dict) ? pfx->cpp_dict->size() : 0;
+}
+
+extern "C" void *oh2_objc_data_create(const void *bytes, size_t len) {
+    return darwin_CFDataCreateWithBytesNoCopy(nullptr, (const uint8_t *)bytes, (int64_t)len, nullptr);
+}
+
+extern "C" const void *oh2_objc_data_bytes(const void *data) {
+    return darwin_CFDataGetBytePtr(data);
+}
+
+extern "C" size_t oh2_objc_data_length(const void *data) {
+    int64_t n = darwin_CFDataGetLength(data);
+    return n > 0 ? (size_t)n : 0;
 }

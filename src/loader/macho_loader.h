@@ -140,6 +140,44 @@ void  oh2_symbol_resolver_init(MachOImage *img);
 int   oh2_objc_register_image(MachOImage *img);
 void *darwin_resolve_symbol(const char *dylib_path, const char *sym_name);
 const char *darwin_cfstring_utf8(const void *cfstr_obj, char *scratch, size_t scratch_size);
+void *darwin_objc_lookup_imp(void *self, const char *sel);
+void *darwin_objc_lookup_super2_imp(void *sup, const char *sel);
+
+/* M2 Extension Hooks (zero overhead / no-op unless explicitly configured by M2 runtime) */
+void        oh2_symbol_register_override(const char *sym_name, void *addr);
+void        oh2_objc_register_instance_method(const char *cls_name, const char *sel_name, void *imp);
+void        oh2_objc_register_class_method(const char *cls_name, const char *sel_name, void *imp);
+void       *oh2_objc_get_class(const char *cls_name);
+void       *oh2_objc_alloc_instance(void *cls, size_t extra_bytes);
+void       *oh2_objc_create_string(const char *utf8);
+void       *oh2_objc_create_string_len(const char *utf8, size_t len);
+const char *oh2_objc_intern_selector(const char *sel_name);
+void       *oh2_objc_lookup_imp(void *self, const char *sel);
+void       *oh2_objc_lookup_super2_imp(void *sup, const char *sel);
+int         oh2_objc_is_heap_object(const void *obj);
+int32_t     oh2_objc_get_refcount(const void *obj);
+int32_t     oh2_objc_add_refcount(void *obj, int32_t delta);
+void        oh2_objc_set_bundle_root(const char *path);
+const char *oh2_objc_get_bundle_root(void);
+
+/* Toll-free CF <-> Foundation container helpers */
+void       *oh2_objc_array_create(const void **items, size_t count);
+void        oh2_objc_array_add(void *arr, void *item);
+size_t      oh2_objc_array_count(const void *arr);
+void       *oh2_objc_array_get(const void *arr, size_t idx);
+void       *oh2_objc_dict_create(void);
+void        oh2_objc_dict_set(void *dict, const char *key, void *val);
+void       *oh2_objc_dict_get(const void *dict, const char *key);
+size_t      oh2_objc_dict_count(const void *dict);
+void       *oh2_objc_data_create(const void *bytes, size_t len);
+const void *oh2_objc_data_bytes(const void *data);
+size_t      oh2_objc_data_length(const void *data);
+
+typedef int  (*oh2_open_handler_t)(const char *path, int d_flags, char *darwin_sp);
+void         oh2_variadic_set_open_handler(oh2_open_handler_t fn);
+
+typedef void (*oh2_ue4_log_hook_t)(const char *msg);
+void         oh2_variadic_set_log_hook(oh2_ue4_log_hook_t fn);
 
 /* Logging helper mirrored to logcat + stdout */
 void oh2_log_info(const char *fmt, ...);

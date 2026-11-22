@@ -43,3 +43,19 @@
   1. Installed `macholib 1.16.4`, `capstone 5.0.9`, and `lief 1.0.0` (`cp312-abi3-win_amd64` wheel loads cleanly on Python `3.14.7`), paired with stdlib `struct`, `numpy`, and NDK `llvm-readelf`/`llvm-objdump`.
   2. Downloaded official Khronos `Vulkan-ValidationLayers` release `vulkan-sdk-1.4.350.0` (`android-binaries-1.4.350.0.zip`) matching the host Vulkan SDK, extracted `arm64-v8a/libVkLayer_khronos_validation.so` (`26,345,704` bytes, stripped `ELF64` `AArch64` `DYN`), and vendored it at `third_party/vulkan_validation/arm64-v8a/libVkLayer_khronos_validation.so` (SHA256 `34A741D51CB6E9111EC52CDA20EEE812BCFBCD197348C1404232AACB60E89EF3`).
 - **Consequences**: Full offline Mach-O/ELF inspection and M3 Android Vulkan validation readiness without relying on external runtime downloads during later milestones.
+
+## ADR-007: Apple OSS (`objc4` / CF / `libdispatch` / Blocks) Evaluation vs Mach-O 64-bit ABI Bridge
+- **Date**: 2026-11-22
+- **Status**: Accepted
+- **Context**: M2 requires full ARM64 Objective-C message dispatch (`objc_msgSend`, `objc_msgSendSuper2`, `objc_msgSend_stret` preserving `x0..x8` and `q0..q7`), ARC/autorelease pools, `@synchronized`, Blocks, GCD, CoreFoundation/Foundation/UIKit bridges, and safe `PLCrashReporter`/GameKit/StoreKit/CloudKit stubs for `Payload/OH2.app/OH2`.
+- **Decision**:
+  1. Rejected GNUstep `libobjc2` due to incompatible class/`method_list_t`/selector ABI relative to Apple's ARM64 Mach-O runtime layout used across OH2's `60` internal classes and `134` external classrefs.
+  2. Evaluated porting upstream Apple OSS `objc4`, `swift-corelibs-foundation`, and `libdispatch` onto Android Bionic: compiling those upstreams cleanly without XNU Mach IPC ports (`mach_msg`, `bootstrap_look_up`, `voucher_t`) introduces heavy build/porting churn for Mach primitives that do not exist on Linux. Instead, extend M1's exact Mach-O 64-bit `DarwinObjCClass` / `DarwinCFString` / `DarwinObjCPrefix` runtime (`src/runtime/`) with dedicated ARM64 assembly trampolines (`objc_msgSend_arm64.S`), real thread-safe `@synchronized`, thread-local autorelease pools, Apple-ABI `_Block_copy`/`_Block_release`, GCD queues/semaphores, toll-free CF <-> Foundation containers, real `NSThread`/`NSTimer`/`CADisplayLink`, and direct `PLCrashReporter` + Mach-port isolation.
+- **Consequences**: Zero Mach kernel IPC dependencies, 100% layout fidelity with `OH2`'s Mach-O ObjC metadata, and clean coexistence with `gate_m1.ps1`.
+
+## ADR-008: Darwin `libc_wrapper` ABI Translation & Bundle Path Strategy
+- **Date**: 2026-11-22
+- **Status**: Accepted
+- **Context**: `OH2` invokes Darwin `libSystem.B.dylib` APIs whose struct layouts and constants diverge silently from Android Bionic (`EAGAIN` is `35` on Darwin vs `11` on Linux; BSD `sockaddr_in` carries `uint8_t sin_len` at `+0`; `struct stat` is `144` bytes; `struct dirent` places `d_name` at `+21` after `d_seekoff`; `open()` flags differ; `pthread_mutex_t` uses `0x32aaaba7`/`0x32aaaba2` magic; `FMallocBinned2` assumes `0x4000` 16 KiB page alignment; iOS case-insensitive APFS paths use mixed casing).
+- **Decision**: Implement a dedicated Darwin-to-Bionic C translation layer (`src/libc_wrapper/`) registering overrides via `oh2_symbol_register_override` and `oh2_variadic_set_open_handler`: bidirectional errno translation in `___error()`, BSD `sockaddr_in`/`sockaddr_in6`/`addrinfo`/`SOL_SOCKET`/`SO_NOSIGPIPE` translation, 144-byte `DarwinStat64` and per-stream `DarwinDirent64`, multi-component case-insensitive path resolution with `/cookeddata/` fallback mapping `@executable_path/` and `/var/.../OH2.app/` -> `/sdcard/Android/data/com.oceanhorn2.port/files/`, lazy-initialized static mutex/cond/rwlock + 2 MiB minimum worker stack, and `posix_memalign`-backed 16 KiB `oh2_darwin_malloc`.
+- **Consequences**: Unmodified `OH2` `MainAppThread:` discovers, opens, stats, and reads `oh2-ios.pak` directly from Android app storage without re-cooking assets.
