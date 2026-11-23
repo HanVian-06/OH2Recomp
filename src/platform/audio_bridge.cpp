@@ -5,6 +5,7 @@
 #include <android/log.h>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -73,9 +74,13 @@ struct DarwinAURenderCallbackStruct {
     void *inputProcRefCon;
 };
 
+static constexpr uint32_t kSubType3DMixerEmbedded  = 0x3364656dU; /* '3dem' */
+static constexpr uint32_t kSubTypeMultiChannelMix  = 0x6d636d78U; /* 'mcmx' */
+
 struct FakeAudioUnit {
     uint32_t               node_id = 0;
     uint32_t               type = 0;
+    uint32_t               sub_type = 0;
     uint32_t               sample_rate = 44100;
     uint32_t               channels = 1;
     bool                   is_float = false;
@@ -102,20 +107,43 @@ struct AudioBus {
     bool                   is_non_interleaved = false;
     bool                   has_input_asbd = false;
     bool                   has_cb = false;
-    bool                   enabled = true;
-    float                  volume = 1.0f;
-    float                  pan = 0.0f;
+    bool                   enabled = false;
+    bool                   is_3d_mixer = true;
+    float                  volume = 0.0f;       /* linear gain (from dB for AU3DMixerEmbedded) */
+    float                  pan_L = 0.70710678f; /* constant-power left gain */
+    float                  pan_R = 0.70710678f; /* constant-power right gain */
+    float                  playback_rate = 1.0f;
+    uint64_t               reset_gen = 1;
 };
 
 struct ActiveAudioBus {
     uint32_t               bus_idx = 0;
     DarwinAURenderCallback cb = nullptr;
     void                  *ref = nullptr;
+    uint32_t               sample_rate = 44100;
     uint32_t               channels = 1;
     bool                   is_float = false;
     bool                   is_non_interleaved = false;
-    float                  volume = 1.0f;
-    float                  pan = 0.0f;
+    float                  volume = 0.0f;
+    float                  pan_L = 0.70710678f;
+    float                  pan_R = 0.70710678f;
+    float                  playback_rate = 1.0f;
+    uint64_t               reset_gen = 0;
+};
+
+/* Per-bus resampling state owned exclusively by the audio pump thread */
+static constexpr uint32_t kAudioChunkFrames     = 512;
+static constexpr size_t   kBusFifoCap           = 4096;
+static constexpr size_t   kRingCap              = 16384; /* power of 2 */
+static constexpr size_t   kRingMask             = kRingCap - 1;
+static constexpr size_t   kTargetBufferedFrames = 4096;  /* ~85 ms cushion */
+
+struct BusResamplerState {
+    float    fifo_L[kBusFifoCap]{};
+    float    fifo_R[kBusFifoCap]{};
+    size_t   fifo_count = 0;
+    double   pos = 0.0;
+    uint64_t last_reset_gen = 0;
 };
 
 static std::mutex g_audio_mutex;
@@ -123,6 +151,7 @@ static AAudioStream *g_aaudio_stream = nullptr;
 static std::atomic<bool> g_audio_active{false};
 static std::atomic<bool> g_audio_paused{false};
 static AudioBus g_buses[kMaxAudioBuses]{};
+static bool g_graph_uses_3d_mixer = true;
 static float g_master_volume = 1.0f;
 static uint32_t g_ue4_sample_rate = 44100;
 static uint32_t g_aaudio_sample_rate = 44100;
@@ -132,24 +161,13 @@ static uint64_t g_sample_cursor = 0;
 static std::atomic<uint64_t> g_stream_gen{1};
 static void *g_av_audio_session = nullptr;
 
-/* Dedicated background audio pump thread + lock-free SPSC ring buffer so the real-time
-   AAudio callback never blocks on a mutex or invokes heavy UE4 Vorbis/ADPCM decode callbacks. */
-static constexpr uint32_t kAudioChunkFrames     = 512;
-static constexpr size_t   kAudioFifoCap         = 16384;
-static constexpr size_t   kRingCap              = 16384; /* power of 2 */
-static constexpr size_t   kRingMask             = kRingCap - 1;
-static constexpr size_t   kTargetBufferedFrames = 4096;  /* ~85 ms cushion at 48 kHz */
-
-static int16_t s_bus_i16[kAudioChunkFrames * 2]{};
-static float   s_bus_f32[kAudioChunkFrames * 2]{};
-static float   s_bus_f32_r[kAudioChunkFrames]{};
-static float   s_mix_L[kAudioChunkFrames]{};
-static float   s_mix_R[kAudioChunkFrames]{};
-static float   s_fifo_L[kAudioFifoCap]{};
-static float   s_fifo_R[kAudioFifoCap]{};
-static size_t  s_fifo_count = 0;
-static double  s_resample_pos = 0.0;
-static uint64_t s_pump_stream_gen = 0;
+static int16_t           s_bus_i16[kAudioChunkFrames * 2]{};
+static float             s_bus_f32[kAudioChunkFrames * 2]{};
+static float             s_bus_f32_r[kAudioChunkFrames]{};
+static float             s_mix_L[kAudioChunkFrames]{};
+static float             s_mix_R[kAudioChunkFrames]{};
+static BusResamplerState s_bus_rs[kMaxAudioBuses]{};
+static uint64_t          s_pump_stream_gen = 0;
 
 static float                 s_ring_L[kRingCap]{};
 static float                 s_ring_R[kRingCap]{};
@@ -159,8 +177,91 @@ static std::atomic<bool>     g_pump_running{false};
 static std::atomic<bool>     g_pump_stop{false};
 static std::thread           g_pump_thread;
 
-static inline float clamp_audio(float x) {
-    return (x < -1.0f) ? -1.0f : ((x > 1.0f) ? 1.0f : x);
+static inline float soft_limit_audio(float x) {
+    if (x > 0.92f) {
+        return 0.92f + 0.08f * std::tanh((x - 0.92f) * 12.5f);
+    }
+    if (x < -0.92f) {
+        return -0.92f + 0.08f * std::tanh((x + 0.92f) * 12.5f);
+    }
+    return x;
+}
+
+static inline void set_bus_pan_from_norm(AudioBus &b, float pan_norm) {
+    /* pan_norm in [-1.0 (hard Left), +1.0 (hard Right)], constant-power pan law */
+    float p = std::max(-1.0f, std::min(1.0f, pan_norm));
+    constexpr float kQuarterPi = 0.7853981633974483f;
+    float angle = (p + 1.0f) * kQuarterPi;
+    b.pan_L = std::cos(angle);
+    b.pan_R = std::sin(angle);
+}
+
+static inline float db_to_linear(float db) {
+    if (db <= -100.0f) return 0.0f;
+    float clamped_db = std::min(20.0f, db);
+    return std::pow(10.0f, clamped_db * 0.05f);
+}
+
+static bool pull_bus_chunk(const ActiveAudioBus &b, const DarwinAudioTimeStamp &ts,
+                           float *out_L, float *out_R) {
+    uint32_t action_flags = 0;
+    DarwinAudioBufferList abl{};
+    int32_t cb_rc = -1;
+
+    if (b.is_float && b.is_non_interleaved) {
+        std::memset(s_bus_f32, 0, kAudioChunkFrames * sizeof(float));
+        abl.mNumberBuffers = (b.channels >= 2) ? 2u : 1u;
+        abl.mBuffers[0] = {1u, kAudioChunkFrames * static_cast<uint32_t>(sizeof(float)), s_bus_f32};
+        if (b.channels >= 2) {
+            std::memset(s_bus_f32_r, 0, sizeof(s_bus_f32_r));
+            abl.mBuffers[1] = {1u, kAudioChunkFrames * static_cast<uint32_t>(sizeof(float)), s_bus_f32_r};
+        }
+        cb_rc = b.cb(b.ref, &action_flags, &ts, b.bus_idx, kAudioChunkFrames, &abl);
+    } else if (b.is_float) {
+        const size_t nfloats = static_cast<size_t>(kAudioChunkFrames) * b.channels;
+        std::memset(s_bus_f32, 0, nfloats * sizeof(float));
+        abl.mNumberBuffers = 1u;
+        abl.mBuffers[0] = {b.channels, static_cast<uint32_t>(nfloats * sizeof(float)), s_bus_f32};
+        cb_rc = b.cb(b.ref, &action_flags, &ts, b.bus_idx, kAudioChunkFrames, &abl);
+    } else {
+        const size_t nsamp = static_cast<size_t>(kAudioChunkFrames) * b.channels;
+        std::memset(s_bus_i16, 0, nsamp * sizeof(int16_t));
+        abl.mNumberBuffers = 1u;
+        abl.mBuffers[0] = {b.channels, static_cast<uint32_t>(nsamp * sizeof(int16_t)), s_bus_i16};
+        cb_rc = b.cb(b.ref, &action_flags, &ts, b.bus_idx, kAudioChunkFrames, &abl);
+    }
+
+    if (cb_rc != 0 || (action_flags & 0x10u) != 0) {
+        return false;
+    }
+
+    if (b.channels == 1) {
+        if (b.is_float) {
+            std::memcpy(out_L, s_bus_f32, kAudioChunkFrames * sizeof(float));
+        } else {
+            constexpr float kScale = 1.0f / 32768.0f;
+            for (uint32_t i = 0; i < kAudioChunkFrames; ++i) {
+                out_L[i] = static_cast<float>(s_bus_i16[i]) * kScale;
+            }
+        }
+    } else {
+        if (b.is_float && b.is_non_interleaved) {
+            std::memcpy(out_L, s_bus_f32, kAudioChunkFrames * sizeof(float));
+            std::memcpy(out_R, s_bus_f32_r, kAudioChunkFrames * sizeof(float));
+        } else if (b.is_float) {
+            for (uint32_t i = 0; i < kAudioChunkFrames; ++i) {
+                out_L[i] = s_bus_f32[i * 2 + 0];
+                out_R[i] = s_bus_f32[i * 2 + 1];
+            }
+        } else {
+            constexpr float kScale = 1.0f / 32768.0f;
+            for (uint32_t i = 0; i < kAudioChunkFrames; ++i) {
+                out_L[i] = static_cast<float>(s_bus_i16[i * 2 + 0]) * kScale;
+                out_R[i] = static_cast<float>(s_bus_i16[i * 2 + 1]) * kScale;
+            }
+        }
+    }
+    return true;
 }
 
 static void audio_pump_thread_fn() {
@@ -172,8 +273,10 @@ static void audio_pump_thread_fn() {
 
         const uint64_t cur_gen = g_stream_gen.load(std::memory_order_acquire);
         if (s_pump_stream_gen != cur_gen) {
-            s_fifo_count = 0;
-            s_resample_pos = 0.0;
+            for (uint32_t i = 0; i < kMaxAudioBuses; ++i) {
+                s_bus_rs[i].fifo_count = 0;
+                s_bus_rs[i].pos = 0.0;
+            }
             s_ring_read.store(0, std::memory_order_relaxed);
             s_ring_write.store(0, std::memory_order_release);
             s_pump_stream_gen = cur_gen;
@@ -189,11 +292,9 @@ static void audio_pump_thread_fn() {
 
         ActiveAudioBus active[kMaxAudioBuses];
         uint32_t active_count = 0;
-        uint32_t src_rate = 44100;
         float master_vol = 1.0f;
         {
             std::lock_guard<std::mutex> lk(g_audio_mutex);
-            src_rate = (g_ue4_sample_rate == 44100 || g_ue4_sample_rate == 48000) ? g_ue4_sample_rate : 44100u;
             master_vol = g_master_volume;
             for (uint32_t i = 0; i < kMaxAudioBuses; ++i) {
                 const AudioBus &b = g_buses[i];
@@ -202,166 +303,157 @@ static void audio_pump_thread_fn() {
                     ab.bus_idx = i;
                     ab.cb = b.cb;
                     ab.ref = b.ref;
+                    ab.sample_rate = (b.sample_rate >= 8000 && b.sample_rate <= 96000) ? b.sample_rate : 44100u;
                     ab.channels = (b.channels == 2) ? 2u : 1u;
                     ab.is_float = b.is_float;
                     ab.is_non_interleaved = b.is_non_interleaved;
                     ab.volume = b.volume;
-                    ab.pan = b.pan;
+                    ab.pan_L = b.pan_L;
+                    ab.pan_R = b.pan_R;
+                    ab.playback_rate = b.playback_rate;
+                    ab.reset_gen = b.reset_gen;
                 }
             }
         }
 
-        if (active_count == 0) {
-            s_fifo_count = 0;
-            s_resample_pos = 0.0;
-            usleep(4000);
-            continue;
-        }
-
-        const uint32_t out_rate = g_aaudio_sample_rate ? g_aaudio_sample_rate : 48000u;
-        const double ratio = static_cast<double>(src_rate) / static_cast<double>(out_rate);
+        const uint32_t out_rate = g_aaudio_sample_rate ? g_aaudio_sample_rate : 44100u;
         const size_t free_space = (buffered < kRingCap) ? (kRingCap - buffered - 1) : 0;
-        const size_t want_out = std::min<size_t>(kTargetBufferedFrames - buffered, std::min<size_t>(free_space, 1024));
-        if (want_out == 0) {
+        if (free_space < kAudioChunkFrames) {
             usleep(1000);
             continue;
         }
 
-        const size_t needed = (src_rate == out_rate)
-                                  ? want_out
-                                  : static_cast<size_t>(s_resample_pos + static_cast<double>(want_out) * ratio) + 2;
-
-        while (s_fifo_count < needed && s_fifo_count + kAudioChunkFrames <= kAudioFifoCap) {
-            std::memset(s_mix_L, 0, sizeof(s_mix_L));
-            std::memset(s_mix_R, 0, sizeof(s_mix_R));
-
-            DarwinAudioTimeStamp ts{};
-            ts.mSampleTime = static_cast<double>(g_sample_cursor);
-            ts.mRateScalar = 1.0;
-            ts.mFlags = 1; /* kAudioTimeStampSampleTimeValid */
-            g_sample_cursor += kAudioChunkFrames;
-
-            for (uint32_t bi = 0; bi < active_count; ++bi) {
-                const ActiveAudioBus &b = active[bi];
-                uint32_t action_flags = 0;
-                DarwinAudioBufferList abl{};
-                int32_t cb_rc = -1;
-
-                if (b.is_float && b.is_non_interleaved) {
-                    std::memset(s_bus_f32, 0, kAudioChunkFrames * sizeof(float));
-                    abl.mNumberBuffers = (b.channels >= 2) ? 2u : 1u;
-                    abl.mBuffers[0] = {1u, kAudioChunkFrames * static_cast<uint32_t>(sizeof(float)), s_bus_f32};
-                    if (b.channels >= 2) {
-                        std::memset(s_bus_f32_r, 0, sizeof(s_bus_f32_r));
-                        abl.mBuffers[1] = {1u, kAudioChunkFrames * static_cast<uint32_t>(sizeof(float)), s_bus_f32_r};
-                    }
-                    cb_rc = b.cb(b.ref, &action_flags, &ts, b.bus_idx, kAudioChunkFrames, &abl);
-                } else if (b.is_float) {
-                    const size_t nfloats = static_cast<size_t>(kAudioChunkFrames) * b.channels;
-                    std::memset(s_bus_f32, 0, nfloats * sizeof(float));
-                    abl.mNumberBuffers = 1u;
-                    abl.mBuffers[0] = {b.channels, static_cast<uint32_t>(nfloats * sizeof(float)), s_bus_f32};
-                    cb_rc = b.cb(b.ref, &action_flags, &ts, b.bus_idx, kAudioChunkFrames, &abl);
-                } else {
-                    const size_t nsamp = static_cast<size_t>(kAudioChunkFrames) * b.channels;
-                    std::memset(s_bus_i16, 0, nsamp * sizeof(int16_t));
-                    abl.mNumberBuffers = 1u;
-                    abl.mBuffers[0] = {b.channels, static_cast<uint32_t>(nsamp * sizeof(int16_t)), s_bus_i16};
-                    cb_rc = b.cb(b.ref, &action_flags, &ts, b.bus_idx, kAudioChunkFrames, &abl);
-                }
-
-                if (cb_rc != 0 || (action_flags & 0x10u) != 0) {
-                    continue;
-                }
-
-                const float vol = b.volume;
-                if (vol <= 0.0f) continue;
-
-                if (b.channels == 1) {
-                    const float gL = vol * std::min(1.0f, 1.0f - b.pan);
-                    const float gR = vol * std::min(1.0f, 1.0f + b.pan);
-                    if (b.is_float) {
-                        for (uint32_t i = 0; i < kAudioChunkFrames; ++i) {
-                            const float s = s_bus_f32[i];
-                            s_mix_L[i] += s * gL;
-                            s_mix_R[i] += s * gR;
-                        }
-                    } else {
-                        constexpr float kScale = 1.0f / 32768.0f;
-                        for (uint32_t i = 0; i < kAudioChunkFrames; ++i) {
-                            const float s = static_cast<float>(s_bus_i16[i]) * kScale;
-                            s_mix_L[i] += s * gL;
-                            s_mix_R[i] += s * gR;
-                        }
-                    }
-                } else {
-                    if (b.is_float && b.is_non_interleaved) {
-                        for (uint32_t i = 0; i < kAudioChunkFrames; ++i) {
-                            s_mix_L[i] += s_bus_f32[i] * vol;
-                            s_mix_R[i] += s_bus_f32_r[i] * vol;
-                        }
-                    } else if (b.is_float) {
-                        for (uint32_t i = 0; i < kAudioChunkFrames; ++i) {
-                            s_mix_L[i] += s_bus_f32[i * 2 + 0] * vol;
-                            s_mix_R[i] += s_bus_f32[i * 2 + 1] * vol;
-                        }
-                    } else {
-                        constexpr float kScale = 1.0f / 32768.0f;
-                        for (uint32_t i = 0; i < kAudioChunkFrames; ++i) {
-                            s_mix_L[i] += static_cast<float>(s_bus_i16[i * 2 + 0]) * kScale * vol;
-                            s_mix_R[i] += static_cast<float>(s_bus_i16[i * 2 + 1]) * kScale * vol;
-                        }
-                    }
-                }
-            }
-
+        if (active_count == 0) {
+            /* Write silence into ring so AAudio output remains smooth without stale artifacts */
+            uint64_t cur_w = w_pos;
             for (uint32_t i = 0; i < kAudioChunkFrames; ++i) {
-                s_fifo_L[s_fifo_count + i] = clamp_audio(s_mix_L[i] * master_vol);
-                s_fifo_R[s_fifo_count + i] = clamp_audio(s_mix_R[i] * master_vol);
+                const size_t slot = static_cast<size_t>(cur_w & kRingMask);
+                s_ring_L[slot] = 0.0f;
+                s_ring_R[slot] = 0.0f;
+                cur_w++;
             }
-            s_fifo_count += kAudioChunkFrames;
+            s_ring_write.store(cur_w, std::memory_order_release);
+            usleep(2000);
+            continue;
+        }
+
+        std::memset(s_mix_L, 0, sizeof(s_mix_L));
+        std::memset(s_mix_R, 0, sizeof(s_mix_R));
+
+        DarwinAudioTimeStamp ts{};
+        ts.mSampleTime = static_cast<double>(g_sample_cursor);
+        ts.mRateScalar = 1.0;
+        ts.mFlags = 1; /* kAudioTimeStampSampleTimeValid */
+        g_sample_cursor += kAudioChunkFrames;
+
+        static float s_tmp_L[kAudioChunkFrames];
+        static float s_tmp_R[kAudioChunkFrames];
+
+        for (uint32_t bi = 0; bi < active_count; ++bi) {
+            const ActiveAudioBus &b = active[bi];
+            BusResamplerState &rs = s_bus_rs[b.bus_idx];
+            if (rs.last_reset_gen != b.reset_gen) {
+                rs.fifo_count = 0;
+                rs.pos = 0.0;
+                rs.last_reset_gen = b.reset_gen;
+            }
+
+            const double eff_rate = static_cast<double>(b.sample_rate) * static_cast<double>(b.playback_rate);
+            const double step = eff_rate / static_cast<double>(out_rate);
+
+            /* Fast 1:1 path when bus rate * pitch matches AAudio hardware rate */
+            if (std::fabs(step - 1.0) < 0.002 && rs.fifo_count == 0) {
+                if (!pull_bus_chunk(b, ts, s_tmp_L, s_tmp_R)) continue;
+                const float vol = b.volume;
+                if (vol <= 0.00001f) continue;
+                if (b.channels == 1) {
+                    const float gL = vol * b.pan_L;
+                    const float gR = vol * b.pan_R;
+                    for (uint32_t i = 0; i < kAudioChunkFrames; ++i) {
+                        const float s = s_tmp_L[i];
+                        s_mix_L[i] += s * gL;
+                        s_mix_R[i] += s * gR;
+                    }
+                } else {
+                    for (uint32_t i = 0; i < kAudioChunkFrames; ++i) {
+                        s_mix_L[i] += s_tmp_L[i] * vol;
+                        s_mix_R[i] += s_tmp_R[i] * vol;
+                    }
+                }
+                continue;
+            }
+
+            /* Per-bus resampled path (accurate sample rate conversion + dynamic pitch shift) */
+            const size_t needed = static_cast<size_t>(rs.pos + static_cast<double>(kAudioChunkFrames) * step) + 2;
+            bool bus_silent = false;
+            while (rs.fifo_count < needed && rs.fifo_count + kAudioChunkFrames <= kBusFifoCap) {
+                if (!pull_bus_chunk(b, ts, rs.fifo_L + rs.fifo_count, rs.fifo_R + rs.fifo_count)) {
+                    bus_silent = true;
+                    break;
+                }
+                rs.fifo_count += kAudioChunkFrames;
+            }
+            if (rs.fifo_count == 0) continue;
+
+            const float vol = b.volume;
+            if (vol > 0.00001f) {
+                if (b.channels == 1) {
+                    const float gL = vol * b.pan_L;
+                    const float gR = vol * b.pan_R;
+                    double p = rs.pos;
+                    for (uint32_t i = 0; i < kAudioChunkFrames; ++i) {
+                        size_t idx = static_cast<size_t>(p);
+                        if (idx >= rs.fifo_count) idx = rs.fifo_count - 1;
+                        const size_t idx1 = (idx + 1 < rs.fifo_count) ? (idx + 1) : idx;
+                        const float frac = static_cast<float>(p - static_cast<double>(idx));
+                        const float s = rs.fifo_L[idx] + (rs.fifo_L[idx1] - rs.fifo_L[idx]) * frac;
+                        s_mix_L[i] += s * gL;
+                        s_mix_R[i] += s * gR;
+                        p += step;
+                    }
+                    rs.pos = p;
+                } else {
+                    double p = rs.pos;
+                    for (uint32_t i = 0; i < kAudioChunkFrames; ++i) {
+                        size_t idx = static_cast<size_t>(p);
+                        if (idx >= rs.fifo_count) idx = rs.fifo_count - 1;
+                        const size_t idx1 = (idx + 1 < rs.fifo_count) ? (idx + 1) : idx;
+                        const float frac = static_cast<float>(p - static_cast<double>(idx));
+                        const float l = rs.fifo_L[idx] + (rs.fifo_L[idx1] - rs.fifo_L[idx]) * frac;
+                        const float r = rs.fifo_R[idx] + (rs.fifo_R[idx1] - rs.fifo_R[idx]) * frac;
+                        s_mix_L[i] += l * vol;
+                        s_mix_R[i] += r * vol;
+                        p += step;
+                    }
+                    rs.pos = p;
+                }
+            } else {
+                rs.pos += static_cast<double>(kAudioChunkFrames) * step;
+            }
+
+            const size_t consumed = std::min(rs.fifo_count, static_cast<size_t>(rs.pos));
+            if (consumed > 0) {
+                const size_t left = rs.fifo_count - consumed;
+                if (left > 0) {
+                    std::memmove(rs.fifo_L, rs.fifo_L + consumed, left * sizeof(float));
+                    if (b.channels == 2) {
+                        std::memmove(rs.fifo_R, rs.fifo_R + consumed, left * sizeof(float));
+                    }
+                }
+                rs.fifo_count = left;
+                rs.pos -= static_cast<double>(consumed);
+            }
+            if (bus_silent && rs.fifo_count == 0) {
+                rs.pos = 0.0;
+            }
         }
 
         uint64_t cur_w = w_pos;
-        if (src_rate == out_rate) {
-            const size_t avail = std::min<size_t>(s_fifo_count, want_out);
-            for (size_t i = 0; i < avail; ++i) {
-                const size_t slot = static_cast<size_t>(cur_w & kRingMask);
-                s_ring_L[slot] = s_fifo_L[i];
-                s_ring_R[slot] = s_fifo_R[i];
-                cur_w++;
-            }
-            if (avail < s_fifo_count) {
-                const size_t left = s_fifo_count - avail;
-                std::memmove(s_fifo_L, s_fifo_L + avail, left * sizeof(float));
-                std::memmove(s_fifo_R, s_fifo_R + avail, left * sizeof(float));
-            }
-            s_fifo_count -= avail;
-        } else {
-            for (size_t i = 0; i < want_out; ++i) {
-                if (s_fifo_count == 0) break;
-                size_t idx = static_cast<size_t>(s_resample_pos);
-                if (idx >= s_fifo_count) idx = s_fifo_count - 1;
-                const size_t idx1 = (idx + 1 < s_fifo_count) ? (idx + 1) : idx;
-                const float frac = static_cast<float>(s_resample_pos - static_cast<double>(idx));
-                const float l = s_fifo_L[idx] + (s_fifo_L[idx1] - s_fifo_L[idx]) * frac;
-                const float r = s_fifo_R[idx] + (s_fifo_R[idx1] - s_fifo_R[idx]) * frac;
-                const size_t slot = static_cast<size_t>(cur_w & kRingMask);
-                s_ring_L[slot] = l;
-                s_ring_R[slot] = r;
-                cur_w++;
-                s_resample_pos += ratio;
-            }
-            const size_t consumed = std::min(s_fifo_count, static_cast<size_t>(s_resample_pos));
-            if (consumed > 0) {
-                const size_t left = s_fifo_count - consumed;
-                if (left > 0) {
-                    std::memmove(s_fifo_L, s_fifo_L + consumed, left * sizeof(float));
-                    std::memmove(s_fifo_R, s_fifo_R + consumed, left * sizeof(float));
-                }
-                s_fifo_count = left;
-                s_resample_pos -= static_cast<double>(consumed);
-            }
+        for (uint32_t i = 0; i < kAudioChunkFrames; ++i) {
+            const size_t slot = static_cast<size_t>(cur_w & kRingMask);
+            s_ring_L[slot] = soft_limit_audio(s_mix_L[i] * master_vol);
+            s_ring_R[slot] = soft_limit_audio(s_mix_R[i] * master_vol);
+            cur_w++;
         }
         s_ring_write.store(cur_w, std::memory_order_release);
     }
@@ -516,8 +608,19 @@ static int32_t at_AUGraphAddNode(FakeAUGraph *g, const DarwinAudioComponentDescr
     auto *u = new FakeAudioUnit();
     u->node_id = static_cast<uint32_t>(g->units.size()) + 1;
     u->type = desc ? desc->componentType : 0;
+    u->sub_type = desc ? desc->componentSubType : 0;
     g->units.push_back(u);
     *outNode = static_cast<int32_t>(u->node_id);
+
+    if (u->sub_type == kSubType3DMixerEmbedded) {
+        std::lock_guard<std::mutex> lk(g_audio_mutex);
+        g_graph_uses_3d_mixer = true;
+    } else if (u->sub_type == kSubTypeMultiChannelMix) {
+        std::lock_guard<std::mutex> lk(g_audio_mutex);
+        g_graph_uses_3d_mixer = false;
+    }
+    AUDIO_LOGI("AUGraphAddNode node=%u type=0x%x sub=0x%x (3d_mixer=%d)",
+               u->node_id, u->type, u->sub_type, g_graph_uses_3d_mixer ? 1 : 0);
     return 0;
 }
 
@@ -538,19 +641,33 @@ static int32_t at_AUGraphSetNodeInputCallback(FakeAUGraph *g, int32_t dstNode, u
     std::lock_guard<std::mutex> lk(g_audio_mutex);
     DarwinAURenderCallback proc = cb ? cb->inputProc : nullptr;
     void *ref = cb ? cb->inputProcRefCon : nullptr;
-    if (dstBus < kMaxAudioBuses) {
-        g_buses[dstBus].cb = proc;
-        g_buses[dstBus].ref = ref;
-        g_buses[dstBus].has_cb = (proc != nullptr);
-    }
+    bool is_3d = g_graph_uses_3d_mixer;
     if (g && dstNode > 0 && static_cast<size_t>(dstNode) <= g->units.size()) {
-        g->units[static_cast<size_t>(dstNode - 1)]->cb = proc;
-        g->units[static_cast<size_t>(dstNode - 1)]->cb_ref = ref;
+        FakeAudioUnit *u = g->units[static_cast<size_t>(dstNode - 1)];
+        u->cb = proc;
+        u->cb_ref = ref;
+        if (u->sub_type == kSubType3DMixerEmbedded) is_3d = true;
+        else if (u->sub_type == kSubTypeMultiChannelMix) is_3d = false;
+    }
+    if (dstBus < kMaxAudioBuses) {
+        AudioBus &b = g_buses[dstBus];
+        b.cb = proc;
+        b.ref = ref;
+        b.has_cb = (proc != nullptr);
+        b.is_3d_mixer = is_3d;
+        /* For AU3DMixerEmbedded, UE4 explicitly enables buses via k3DMixerParam_Enable (5) on Play().
+           For non-3D mixers, default enabled=true, volume=1.0f. */
+        if (!is_3d && proc != nullptr) {
+            b.enabled = true;
+            if (b.volume <= 0.0f) b.volume = 1.0f;
+        }
+        b.reset_gen++;
     }
     static uint32_t s_cb_logs = 0;
     if (s_cb_logs < 8) {
         s_cb_logs++;
-        AUDIO_LOGI("AUGraphSetNodeInputCallback node=%d bus=%u cb=%p", dstNode, dstBus, reinterpret_cast<void *>(proc));
+        AUDIO_LOGI("AUGraphSetNodeInputCallback node=%d bus=%u cb=%p (3d=%d)",
+                   dstNode, dstBus, reinterpret_cast<void *>(proc), is_3d ? 1 : 0);
     }
     return 0;
 }
@@ -573,7 +690,20 @@ static int32_t at_AudioUnitSetProperty(void *inUnit, uint32_t propID, uint32_t s
     if (!inData) return 0;
 
     std::unique_lock<std::mutex> lk(g_audio_mutex);
-    if (propID == 8 && inDataSize >= sizeof(DarwinAudioStreamBasicDescription)) {
+    if (propID == 2 && inDataSize >= sizeof(double)) {
+        /* kAudioUnitProperty_SampleRate */
+        double sr = *static_cast<const double *>(inData);
+        uint32_t rate = (sr > 0.0) ? static_cast<uint32_t>(sr + 0.5) : 0u;
+        if (scope == 2 && (rate == 44100 || rate == 48000)) {
+            bool changed = (g_ue4_sample_rate != rate);
+            g_ue4_sample_rate = rate;
+            if (g_aaudio_stream && changed && g_ue4_sample_rate != g_last_requested_rate) {
+                start_aaudio_locked(lk, g_ue4_sample_rate);
+            }
+        } else if (scope == 1 && element < kMaxAudioBuses && rate >= 8000 && rate <= 96000) {
+            g_buses[element].sample_rate = rate;
+        }
+    } else if (propID == 8 && inDataSize >= sizeof(DarwinAudioStreamBasicDescription)) {
         /* kAudioUnitProperty_StreamFormat */
         const auto *asbd = static_cast<const DarwinAudioStreamBasicDescription *>(inData);
         uint32_t rate = (asbd->mSampleRate > 0.0) ? static_cast<uint32_t>(asbd->mSampleRate + 0.5) : 0u;
@@ -582,25 +712,26 @@ static int32_t at_AudioUnitSetProperty(void *inUnit, uint32_t propID, uint32_t s
         bool is_non_int = (asbd->mFormatFlags & (1U << 5)) != 0; /* kAudioFormatFlagIsNonInterleaved */
 
         bool rate_changed = false;
-        if (rate == 44100 || rate == 48000) {
+        if (scope == 2 && (rate == 44100 || rate == 48000)) {
             if (g_ue4_sample_rate != rate) rate_changed = true;
             g_ue4_sample_rate = rate;
         }
         if (scope == 1 && element < kMaxAudioBuses) { /* kAudioUnitScope_Input */
             AudioBus &b = g_buses[element];
-            b.sample_rate = (rate == 44100 || rate == 48000) ? rate : g_ue4_sample_rate;
+            b.sample_rate = (rate >= 8000 && rate <= 96000) ? rate : g_ue4_sample_rate;
             b.channels = ch;
             b.is_float = is_float;
             b.is_non_interleaved = is_non_int;
             b.has_input_asbd = true;
+            b.reset_gen++;
         } else if (scope == 2 && element == 0 && !g_buses[0].has_input_asbd) { /* kAudioUnitScope_Output fallback */
-            g_buses[0].sample_rate = (rate == 44100 || rate == 48000) ? rate : g_ue4_sample_rate;
+            g_buses[0].sample_rate = (rate >= 8000 && rate <= 96000) ? rate : g_ue4_sample_rate;
             g_buses[0].channels = ch;
             g_buses[0].is_float = is_float;
             g_buses[0].is_non_interleaved = is_non_int;
         }
         if (u) {
-            u->sample_rate = g_ue4_sample_rate;
+            u->sample_rate = (rate >= 8000 && rate <= 96000) ? rate : g_ue4_sample_rate;
             u->channels = ch;
             u->is_float = is_float;
             u->is_non_interleaved = is_non_int;
@@ -628,9 +759,17 @@ static int32_t at_AudioUnitSetProperty(void *inUnit, uint32_t propID, uint32_t s
         /* kAudioUnitProperty_SetRenderCallback */
         const auto *cbs = static_cast<const DarwinAURenderCallbackStruct *>(inData);
         uint32_t bus = (element < kMaxAudioBuses) ? element : 0u;
+        bool is_3d = (u && u->sub_type == kSubType3DMixerEmbedded) ? true :
+                     (u && u->sub_type == kSubTypeMultiChannelMix) ? false : g_graph_uses_3d_mixer;
         g_buses[bus].cb = cbs->inputProc;
         g_buses[bus].ref = cbs->inputProcRefCon;
         g_buses[bus].has_cb = (cbs->inputProc != nullptr);
+        g_buses[bus].is_3d_mixer = is_3d;
+        if (!is_3d && cbs->inputProc != nullptr) {
+            g_buses[bus].enabled = true;
+            if (g_buses[bus].volume <= 0.0f) g_buses[bus].volume = 1.0f;
+        }
+        g_buses[bus].reset_gen++;
         if (u) {
             u->cb = cbs->inputProc;
             u->cb_ref = cbs->inputProcRefCon;
@@ -643,22 +782,76 @@ static int32_t at_AudioUnitSetProperty(void *inUnit, uint32_t propID, uint32_t s
 
 static int32_t at_AudioUnitSetParameter(void *inUnit, uint32_t paramID, uint32_t scope,
                                         uint32_t element, float value, uint32_t bufferOffset) {
-    (void)inUnit; (void)bufferOffset;
+    (void)bufferOffset;
+    auto *u = static_cast<FakeAudioUnit *>(inUnit);
     std::lock_guard<std::mutex> lk(g_audio_mutex);
-    if (paramID == 0) { /* kMultiChannelMixerParam_Volume */
-        float clamped = std::max(0.0f, std::min(2.0f, value));
-        if (scope == 2) { /* Output */
-            g_master_volume = clamped;
-        } else if (scope == 1 && element < kMaxAudioBuses) {
-            g_buses[element].volume = clamped;
+
+    bool is_3d = g_graph_uses_3d_mixer;
+    if (u) {
+        if (u->sub_type == kSubType3DMixerEmbedded) is_3d = true;
+        else if (u->sub_type == kSubTypeMultiChannelMix) is_3d = false;
+    }
+
+    if (is_3d) {
+        /* Apple AU3DMixerEmbedded parameter ABI (used by UE4 FIOSAudioDevice):
+         *   0 = k3DMixerParam_Azimuth      (-180..+180 deg; -90=Left, 0=Center, +90=Right)
+         *   1 = k3DMixerParam_Elevation    (-90..+90 deg)
+         *   2 = k3DMixerParam_Distance     (meters)
+         *   3 = k3DMixerParam_Gain         (decibels: -120..+20 dB)
+         *   4 = k3DMixerParam_PlaybackRate (0.01..4.0 pitch/speed ratio)
+         *   5 = k3DMixerParam_Enable       (0=off, 1=on)
+         */
+        if (paramID == 0) {
+            if (scope == 1 && element < kMaxAudioBuses) {
+                constexpr float kDegToRad = 0.017453292519943295f;
+                float pan_norm = std::sin(value * kDegToRad);
+                set_bus_pan_from_norm(g_buses[element], pan_norm);
+            }
+        } else if (paramID == 3) {
+            float lin = db_to_linear(value);
+            if (scope == 2) {
+                g_master_volume = lin;
+            } else if (scope == 1 && element < kMaxAudioBuses) {
+                g_buses[element].volume = lin;
+            }
+        } else if (paramID == 4) {
+            if (scope == 1 && element < kMaxAudioBuses) {
+                g_buses[element].playback_rate = std::max(0.05f, std::min(4.0f, value));
+            }
+        } else if (paramID == 5) {
+            if (scope == 1 && element < kMaxAudioBuses) {
+                bool now_en = (value > 0.5f);
+                if (now_en && !g_buses[element].enabled) {
+                    g_buses[element].reset_gen++;
+                }
+                g_buses[element].enabled = now_en;
+            }
         }
-    } else if (paramID == 1) { /* kMultiChannelMixerParam_Enable */
-        if (scope == 1 && element < kMaxAudioBuses) {
-            g_buses[element].enabled = (value > 0.5f);
-        }
-    } else if (paramID == 2) { /* kMultiChannelMixerParam_Pan */
-        if (scope == 1 && element < kMaxAudioBuses) {
-            g_buses[element].pan = std::max(-1.0f, std::min(1.0f, value));
+    } else {
+        /* Apple MultiChannelMixer parameter ABI:
+         *   0 = kMultiChannelMixerParam_Volume (linear 0..1+)
+         *   1 = kMultiChannelMixerParam_Enable (0/1)
+         *   2 = kMultiChannelMixerParam_Pan    (-1..+1)
+         */
+        if (paramID == 0) {
+            float clamped = std::max(0.0f, std::min(2.0f, value));
+            if (scope == 2) {
+                g_master_volume = clamped;
+            } else if (scope == 1 && element < kMaxAudioBuses) {
+                g_buses[element].volume = clamped;
+            }
+        } else if (paramID == 1) {
+            if (scope == 1 && element < kMaxAudioBuses) {
+                bool now_en = (value > 0.5f);
+                if (now_en && !g_buses[element].enabled) {
+                    g_buses[element].reset_gen++;
+                }
+                g_buses[element].enabled = now_en;
+            }
+        } else if (paramID == 2) {
+            if (scope == 1 && element < kMaxAudioBuses) {
+                set_bus_pan_from_norm(g_buses[element], value);
+            }
         }
     }
     return 0;

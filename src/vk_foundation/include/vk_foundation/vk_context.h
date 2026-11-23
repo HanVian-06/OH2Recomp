@@ -26,6 +26,7 @@ public:
     bool init(const VkContextConfig& cfg);
     bool recreate_swapchain(ANativeWindow* window);
     bool rebind_surface(ANativeWindow* window);
+    void release_surface();
     void destroy();
 
     VkInstance instance() const { return instance_; }

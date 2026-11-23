@@ -32,6 +32,12 @@ int  mtl_vk_init(ANativeWindow *window, const char *spirv_cache_path, int enable
 /* Recreate or rebind Vulkan surface & swapchain after Android window resize/surface recreation */
 int  mtl_vk_set_surface(ANativeWindow *window);
 
+/* Pause rendering and cleanly destroy swapchain/surface when Android destroys the window (Home/background) */
+void mtl_vk_pause_surface(void);
+
+/* Unblock any render thread waiting on a paused surface before shutdown */
+void mtl_vk_begin_shutdown(void);
+
 /* Release all Vulkan resources */
 void mtl_vk_shutdown(void);
 

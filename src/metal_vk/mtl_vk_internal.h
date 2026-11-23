@@ -203,6 +203,7 @@ struct MtlDrawableImpl {
     uint32_t    swapchain_idx = 0;
     uint64_t    drawable_id = 0;
     VkSemaphore acquire_sem = VK_NULL_HANDLE;
+    uint64_t    surface_gen = 0;
     bool        acquired = false;
 };
 
@@ -442,6 +443,7 @@ struct MtlCommandBufferImpl {
     VkSemaphore acquire_wait_sem = VK_NULL_HANDLE;
     bool present_requested = false;
     uint32_t present_sc_idx = 0;
+    uint64_t present_surface_gen = 0;
     void *present_tex_obj = nullptr;
     uint64_t status = 0; /* 0=NotEnqueued, 2=Committed, 4=Completed */
     std::string label;
@@ -656,6 +658,12 @@ struct MtlVkState {
     std::vector<DeferredDestroy> deferred_destroys;
     uint32_t                     next_frame_idx = 0;
     bool                         swapchain_out_of_date = false;
+    std::mutex                   surface_mutex;
+    std::condition_variable      surface_cv;
+    ANativeWindow               *current_window = nullptr;
+    bool                         surface_paused = false;
+    bool                         surface_shutting_down = false;
+    uint64_t                     surface_gen = 1;
 
     /* Fallback 1x1 white texture, dummy sampler, and dummy 4 KiB UBO/SSBO for unbound shader slots */
     VkImage                      dummy_image = VK_NULL_HANDLE;
@@ -797,7 +805,7 @@ VkDescriptorSetLayout create_stage_descriptor_layout(const SpirvShaderEntry *ent
 
 /* Frame synchronization & command execution */
 VkCommandBuffer mtl_begin_command_buffer_internal(MtlCommandBufferImpl *cb);
-bool            mtl_acquire_swapchain_image_internal(MtlMetalLayerImpl *layer, uint32_t *out_sc_idx, VkSemaphore *out_wait_sem);
+bool            mtl_acquire_swapchain_image_internal(MtlMetalLayerImpl *layer, uint32_t *out_sc_idx, VkSemaphore *out_wait_sem, uint64_t *out_surface_gen);
 bool            mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed);
 bool            mtl_alloc_inline_bytes(MtlCommandBufferImpl *cb, const void *data, uint64_t len, VkBuffer *out_buf, uint64_t *out_off);
 void            mtl_sync_buffer_backed_texture_if_dirty(MtlTextureImpl *tex);

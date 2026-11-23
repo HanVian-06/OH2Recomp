@@ -16,8 +16,9 @@ void oh2_platform_shutdown(void);
 /* Forward Android AInputEvent (AMotionEvent) -> UITouch/UIEvent -> FIOSView */
 int32_t oh2_platform_handle_input_event(AInputEvent *event);
 
-/* Start AChoreographer VSYNC frame callback driving CADisplayLink */
+/* Start/stop AChoreographer VSYNC frame callback driving CADisplayLink */
 void oh2_platform_on_choreographer_attach(void);
+void oh2_platform_choreographer_shutdown(void);
 
 /* Ensure AAudio output stream is opened and running (48000 / 44100 Hz) */
 void oh2_platform_audio_ensure_active(void);

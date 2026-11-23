@@ -23,6 +23,7 @@
         android:roundIcon="@mipmap/ic_launcher"
         android:hasCode="false"
         android:debuggable="true"
+        android:enableOnBackInvokedCallback="false"
         android:gwpAsanMode="never"
         android:extractNativeLibs="false">
 
@@ -31,9 +32,11 @@
             android:label="Oceanhorn 2"
             android:exported="true"
             android:launchMode="singleTask"
+            android:alwaysRetainTaskState="true"
+            android:enableOnBackInvokedCallback="false"
             android:screenOrientation="landscape"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
-            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|uiMode">
+            android:configChanges="orientation|keyboardHidden|keyboard|navigation|screenSize|screenLayout|smallestScreenSize|uiMode|density|fontScale|locale|layoutDirection">
             <meta-data
                 android:name="android.app.lib_name"
                 android:value="oh2_android" />

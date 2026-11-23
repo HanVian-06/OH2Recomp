@@ -174,7 +174,19 @@ void oh2_platform_touch_register(void) {
 
 int32_t oh2_platform_handle_input_event(AInputEvent *event) {
     if (!event) return 0;
-    if (AInputEvent_getType(event) != AINPUT_EVENT_TYPE_MOTION) {
+    int32_t ev_type = AInputEvent_getType(event);
+    if (ev_type == AINPUT_EVENT_TYPE_KEY) {
+        int32_t key_code = AKeyEvent_getKeyCode(event);
+        if (key_code == AKEYCODE_BACK) {
+            /* Swallow Back key / edge-swipe back so accidental presses never exit the game */
+            if (AKeyEvent_getAction(event) == AKEY_EVENT_ACTION_UP) {
+                TOUCH_LOGI("Swallowed AKEYCODE_BACK (prevented accidental exit)");
+            }
+            return 1;
+        }
+        return 0;
+    }
+    if (ev_type != AINPUT_EVENT_TYPE_MOTION) {
         return 0;
     }
 

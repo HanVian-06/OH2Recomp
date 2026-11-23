@@ -116,6 +116,17 @@ bool VkContext::rebind_surface(ANativeWindow* window) {
     return create_swapchain(window);
 }
 
+void VkContext::release_surface() {
+    if (device_ != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(device_);
+    }
+    destroy_swapchain();
+    if (surface_ != VK_NULL_HANDLE && instance_ != VK_NULL_HANDLE) {
+        vkDestroySurfaceKHR(instance_, surface_, nullptr);
+        surface_ = VK_NULL_HANDLE;
+    }
+}
+
 void VkContext::destroy() {
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);

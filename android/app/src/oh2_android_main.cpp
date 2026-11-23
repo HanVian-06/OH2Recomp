@@ -304,7 +304,8 @@ static void on_window_ready(Oh2AppState *st) {
         st->vulkan_initialized = true;
     } else {
         mtl_vk_set_surface(st->window);
-        oh2_platform_audio_ensure_active();
+        oh2_platform_on_choreographer_attach();
+        oh2_platform_audio_resume();
     }
 
     if (!st->ue4_started) {
@@ -335,7 +336,7 @@ static void handle_cmd(struct android_app *app, int32_t cmd) {
             break;
         case APP_CMD_GAINED_FOCUS:
         case APP_CMD_RESUME:
-            if (st->vulkan_initialized && !st->test_mode) {
+            if (st->vulkan_initialized && !st->test_mode && st->window) {
                 oh2_platform_on_choreographer_attach();
                 oh2_platform_audio_resume();
             }
@@ -343,18 +344,30 @@ static void handle_cmd(struct android_app *app, int32_t cmd) {
         case APP_CMD_PAUSE:
         case APP_CMD_LOST_FOCUS:
         case APP_CMD_STOP:
-        case APP_CMD_TERM_WINDOW:
             if (st->vulkan_initialized && !st->test_mode) {
                 oh2_platform_audio_pause();
             }
+            break;
+        case APP_CMD_TERM_WINDOW:
+            if (st->vulkan_initialized && !st->test_mode) {
+                oh2_platform_audio_pause();
+                oh2_platform_choreographer_shutdown();
+                mtl_vk_pause_surface();
+            }
+            st->window = nullptr;
             break;
         case APP_CMD_LOW_MEMORY:
             APP_LOGI("[M5/M6] onLowMemory / trim signal received");
             break;
         case APP_CMD_DESTROY:
+            APP_LOGI("[M5] APP_CMD_DESTROY received — shutting down cleanly");
+            mtl_vk_begin_shutdown();
             oh2_runtime_stop_live_loop();
             oh2_platform_shutdown();
             mtl_vk_shutdown();
+            if (!st->test_mode) {
+                _exit(0);
+            }
             break;
         default:
             break;

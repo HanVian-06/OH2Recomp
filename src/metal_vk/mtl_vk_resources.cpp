@@ -1226,7 +1226,8 @@ static void *mtl_layer_nextDrawable(void *self, const char *sel) {
 
     uint32_t sc_idx = 0;
     VkSemaphore wait_sem = VK_NULL_HANDLE;
-    if (!mtl_acquire_swapchain_image_internal(l, &sc_idx, &wait_sem)) {
+    uint64_t surf_gen = 0;
+    if (!mtl_acquire_swapchain_image_internal(l, &sc_idx, &wait_sem, &surf_gen)) {
         return nullptr;
     }
 
@@ -1240,6 +1241,7 @@ static void *mtl_layer_nextDrawable(void *self, const char *sel) {
     dr->swapchain_idx = sc_idx;
     dr->drawable_id = g_drawable_id_counter.fetch_add(1, std::memory_order_relaxed);
     dr->acquire_sem = wait_sem;
+    dr->surface_gen = surf_gen;
     dr->acquired = true;
     dr->texture_obj = wrap_swapchain_image_as_mtl_texture(sc_idx);
 

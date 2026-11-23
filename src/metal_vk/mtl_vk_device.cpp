@@ -655,7 +655,7 @@ bool mtl_alloc_inline_bytes(MtlCommandBufferImpl *cb, const void *data, uint64_t
     return true;
 }
 
-bool mtl_acquire_swapchain_image_internal(MtlMetalLayerImpl *layer, uint32_t *out_sc_idx, VkSemaphore *out_wait_sem) {
+bool mtl_acquire_swapchain_image_internal(MtlMetalLayerImpl *layer, uint32_t *out_sc_idx, VkSemaphore *out_wait_sem, uint64_t *out_surface_gen) {
     MtlVkState &st = get_state();
     if (!st.initialized || !out_sc_idx || !out_wait_sem) return false;
 
@@ -665,29 +665,45 @@ bool mtl_acquire_swapchain_image_internal(MtlMetalLayerImpl *layer, uint32_t *ou
     wait_slot_idle(st, fidx);
     tick_deferred_destroys(false);
 
-    VkSemaphore acq_sem = st.acquire_sem_pool[st.next_acquire_sem];
-    st.next_acquire_sem = (st.next_acquire_sem + 1) % 8;
+    while (true) {
+        std::unique_lock<std::mutex> slk(st.surface_mutex);
+        st.surface_cv.wait(slk, [&]() {
+            return st.surface_shutting_down || (!st.surface_paused && st.vk_ctx.swapchain() != VK_NULL_HANDLE);
+        });
+        if (st.surface_shutting_down) return false;
 
-    uint32_t sc_idx = 0;
-    auto t_acq0 = std::chrono::steady_clock::now();
-    VkResult res = vkAcquireNextImageKHR(
-        dev, st.vk_ctx.swapchain(), UINT64_MAX,
-        acq_sem, VK_NULL_HANDLE, &sc_idx);
-    auto acq_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_acq0).count();
-    st.prof_acq_us.fetch_add((uint64_t)acq_us, std::memory_order_relaxed);
+        VkSemaphore acq_sem = st.acquire_sem_pool[st.next_acquire_sem];
+        uint32_t sc_idx = 0;
+        auto t_acq0 = std::chrono::steady_clock::now();
+        VkResult res = vkAcquireNextImageKHR(
+            dev, st.vk_ctx.swapchain(), 100000000ULL /* 100ms so background pause never stalls */,
+            acq_sem, VK_NULL_HANDLE, &sc_idx);
+        auto acq_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_acq0).count();
+        st.prof_acq_us.fetch_add((uint64_t)acq_us, std::memory_order_relaxed);
 
-    if (res == VK_ERROR_OUT_OF_DATE_KHR) {
-        st.swapchain_out_of_date = true;
-        return false;
-    }
-    if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
+        if (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR) {
+            st.next_acquire_sem = (st.next_acquire_sem + 1) % 8;
+            *out_sc_idx = sc_idx;
+            *out_wait_sem = acq_sem;
+            if (out_surface_gen) *out_surface_gen = st.surface_gen;
+            (void)layer;
+            return true;
+        }
+        if (res == VK_TIMEOUT || res == VK_NOT_READY) {
+            slk.unlock();
+            usleep(2000);
+            continue;
+        }
+        if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_ERROR_SURFACE_LOST_KHR) {
+            st.swapchain_out_of_date = true;
+            slk.unlock();
+            usleep(10000);
+            if (st.surface_paused) continue;
+            return false;
+        }
         MTLVK_LOGE("vkAcquireNextImageKHR failed: %d", static_cast<int>(res));
         return false;
     }
-    *out_sc_idx = sc_idx;
-    *out_wait_sem = acq_sem;
-    (void)layer;
-    return true;
 }
 
 bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
@@ -706,7 +722,18 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
         if (mtl_begin_command_buffer_internal(cb) == VK_NULL_HANDLE) return false;
     }
 
-    if (cb->present_requested && cb->present_tex_obj) {
+    std::unique_lock<std::mutex> surface_lock(st.surface_mutex, std::defer_lock);
+    bool do_present = false;
+    if (cb->present_requested) {
+        surface_lock.lock();
+        do_present = (!st.surface_paused && !st.surface_shutting_down &&
+                      cb->present_surface_gen == st.surface_gen &&
+                      st.vk_ctx.swapchain() != VK_NULL_HANDLE &&
+                      cb->present_sc_idx < st.vk_ctx.swapchain_images().size() &&
+                      cb->present_sc_idx < st.render_finished_sems.size());
+    }
+
+    if (do_present && cb->present_tex_obj) {
         auto *tex = unwrap_mtl<MtlTextureImpl>(cb->present_tex_obj);
         if (tex && tex->is_swapchain) {
             VkImageLayout cur_layout = tex->mip_layouts.empty() ? VK_IMAGE_LAYOUT_UNDEFINED : tex->mip_layouts[0];
@@ -773,9 +800,9 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
     VkPipelineStageFlags wait_stages[1] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
     VkSemaphore signal_sems[1] = {};
     uint32_t signal_count = 0;
-    uint32_t wait_count = (cb->acquire_wait_sem != VK_NULL_HANDLE) ? 1u : 0u;
+    uint32_t wait_count = (do_present && cb->acquire_wait_sem != VK_NULL_HANDLE) ? 1u : 0u;
 
-    if (cb->present_requested && cb->present_sc_idx < st.render_finished_sems.size()) {
+    if (do_present && cb->present_sc_idx < st.render_finished_sems.size()) {
         signal_sems[0] = st.render_finished_sems[cb->present_sc_idx];
         signal_count = 1;
     }
@@ -830,7 +857,7 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
         }
     }
 
-    if (cb->present_requested && signal_count == 1) {
+    if (do_present && signal_count == 1) {
         if (cb->begin_ns > 0 && submit_now_ns > cb->begin_ns) {
             g_adpf.report_work_ns(static_cast<int64_t>(submit_now_ns - cb->begin_ns));
         }
@@ -911,6 +938,12 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
             auto *layer = unwrap_mtl<MtlMetalLayerImpl>(st.shared_layer_obj);
             if (layer) layer->has_active_drawable = false;
         }
+    } else if (cb->present_requested && st.shared_layer_obj) {
+        auto *layer = unwrap_mtl<MtlMetalLayerImpl>(st.shared_layer_obj);
+        if (layer) layer->has_active_drawable = false;
+    }
+    if (surface_lock.owns_lock()) {
+        surface_lock.unlock();
     }
 
     {
@@ -1466,6 +1499,7 @@ static void mtl_cb_presentDrawable(void *self, const char *sel, void *drawable_o
     dr->acquire_sem = VK_NULL_HANDLE;
     cb->present_requested = true;
     cb->present_sc_idx = dr->swapchain_idx;
+    cb->present_surface_gen = dr->surface_gen;
     cb->present_tex_obj = dr->texture_obj;
 }
 
@@ -1982,6 +2016,9 @@ int mtl_vk_init(ANativeWindow *window, const char *spirv_cache_path, int enable_
     }
 
     if (!create_per_swapchain_sync(st)) return -1;
+    st.current_window = window;
+    st.surface_paused = false;
+    st.surface_shutting_down = false;
     st.initialized = true;
     if (!create_dummy_resources(st)) {
         st.initialized = false;
@@ -2017,10 +2054,13 @@ int mtl_vk_init(ANativeWindow *window, const char *spirv_cache_path, int enable_
     return 0;
 }
 
-int mtl_vk_set_surface(ANativeWindow *window) {
+void mtl_vk_pause_surface(void) {
     using namespace oh2::mtlvk;
     MtlVkState &st = get_state();
-    if (!st.initialized || !window) return -1;
+    if (!st.initialized) return;
+    std::lock_guard<std::mutex> slk(st.surface_mutex);
+    if (st.surface_paused) return;
+    st.surface_paused = true;
     VkDevice dev = st.vk_ctx.device();
     wait_all_slots_idle(st);
     {
@@ -2028,26 +2068,73 @@ int mtl_vk_set_surface(ANativeWindow *window) {
         vkDeviceWaitIdle(dev);
     }
     tick_deferred_destroys(true);
-    if (!st.vk_ctx.rebind_surface(window)) {
-        MTLVK_LOGE("VkContext::rebind_surface failed");
-        return -1;
-    }
-    if (!create_per_swapchain_sync(st)) return -1;
-    st.swapchain_out_of_date = false;
-    st.surface_recreates.fetch_add(1, std::memory_order_relaxed);
-    VkExtent2D ext = st.vk_ctx.swapchain_extent();
-    oh2_ui_set_physical_dimensions(ext.width, ext.height);
-    oh2_ui_set_screen_dimensions(st.virtual_render_w, st.virtual_render_h, 2.0);
+    st.vk_ctx.release_surface();
+    st.current_window = nullptr;
     if (st.shared_layer_obj) {
         auto *l = unwrap_mtl<MtlMetalLayerImpl>(st.shared_layer_obj);
-        if (l) {
-            l->drawable_width = (double)st.virtual_render_w;
-            l->drawable_height = (double)st.virtual_render_h;
-            l->has_active_drawable = false;
-        }
+        if (l) l->has_active_drawable = false;
     }
-    MTLVK_LOGI("[M5] Swapchain surface rebuilt #%llu: %ux%u",
-               (unsigned long long)st.surface_recreates.load(), ext.width, ext.height);
+    MTLVK_LOGI("[M5] Swapchain surface paused & released (background)");
+}
+
+void mtl_vk_begin_shutdown(void) {
+    using namespace oh2::mtlvk;
+    MtlVkState &st = get_state();
+    {
+        std::lock_guard<std::mutex> slk(st.surface_mutex);
+        st.surface_shutting_down = true;
+    }
+    st.surface_cv.notify_all();
+}
+
+int mtl_vk_set_surface(ANativeWindow *window) {
+    using namespace oh2::mtlvk;
+    MtlVkState &st = get_state();
+    if (!st.initialized || !window) return -1;
+    {
+        std::lock_guard<std::mutex> slk(st.surface_mutex);
+        VkExtent2D cur_ext = st.vk_ctx.swapchain_extent();
+        int32_t nw = ANativeWindow_getWidth(window);
+        int32_t nh = ANativeWindow_getHeight(window);
+        if (window == st.current_window && !st.surface_paused && !st.swapchain_out_of_date &&
+            st.vk_ctx.swapchain() != VK_NULL_HANDLE &&
+            nw > 0 && nh > 0 &&
+            static_cast<uint32_t>(nw) == cur_ext.width &&
+            static_cast<uint32_t>(nh) == cur_ext.height) {
+            return 0;
+        }
+        VkDevice dev = st.vk_ctx.device();
+        wait_all_slots_idle(st);
+        {
+            std::lock_guard<std::mutex> qlk(st.queue_mutex);
+            vkDeviceWaitIdle(dev);
+        }
+        tick_deferred_destroys(true);
+        if (!st.vk_ctx.rebind_surface(window)) {
+            MTLVK_LOGE("VkContext::rebind_surface failed");
+            return -1;
+        }
+        if (!create_per_swapchain_sync(st)) return -1;
+        st.current_window = window;
+        st.swapchain_out_of_date = false;
+        st.surface_paused = false;
+        st.surface_gen++;
+        st.surface_recreates.fetch_add(1, std::memory_order_relaxed);
+        VkExtent2D ext = st.vk_ctx.swapchain_extent();
+        oh2_ui_set_physical_dimensions(ext.width, ext.height);
+        oh2_ui_set_screen_dimensions(st.virtual_render_w, st.virtual_render_h, 2.0);
+        if (st.shared_layer_obj) {
+            auto *l = unwrap_mtl<MtlMetalLayerImpl>(st.shared_layer_obj);
+            if (l) {
+                l->drawable_width = (double)st.virtual_render_w;
+                l->drawable_height = (double)st.virtual_render_h;
+                l->has_active_drawable = false;
+            }
+        }
+        MTLVK_LOGI("[M5] Swapchain surface rebuilt #%llu: %ux%u (resumed)",
+                   (unsigned long long)st.surface_recreates.load(), ext.width, ext.height);
+    }
+    st.surface_cv.notify_all();
     return 0;
 }
 
