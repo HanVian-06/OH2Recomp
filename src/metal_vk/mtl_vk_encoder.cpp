@@ -1,6 +1,7 @@
 #include "mtl_vk_internal.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -13,6 +14,13 @@ static bool check_begin_cb(MtlCommandBufferImpl *cb) {
     return cb && (cb->recording || mtl_begin_command_buffer_internal(cb) != VK_NULL_HANDLE);
 }
 
+static inline void mix_desc_hash(uint64_t &h1, uint64_t &h2, uint64_t a, uint64_t b) {
+    h1 ^= a + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2);
+    h2 ^= b + 0xbf58476d1ce4e5b9ULL + (h2 << 7) + (h2 >> 3);
+    h1 *= 1099511628211ULL;
+    h2 *= 0x94d049bb133111ebULL;
+}
+
 static VkDescriptorSet allocate_and_write_set(MtlCommandBufferImpl *cb,
                                               VkDescriptorSetLayout layout,
                                               const SpirvShaderEntry *entry,
@@ -20,6 +28,86 @@ static VkDescriptorSet allocate_and_write_set(MtlCommandBufferImpl *cb,
     MtlVkState &st = get_state();
     if (!cb || layout == VK_NULL_HANDLE) return VK_NULL_HANDLE;
     FrameSyncSlot &slot = st.frames[cb->frame_idx];
+
+    const uint16_t bcnt = (entry && entry->bindings) ? std::min<uint16_t>(entry->binding_count, 64) : 0;
+    VkDescriptorBufferInfo buf_infos[64];
+    VkDescriptorImageInfo img_infos[64];
+    VkWriteDescriptorSet writes[64];
+
+    uint64_t h1 = 14695981039346656037ULL ^ (uint64_t)(uintptr_t)layout ^ ((uint64_t)bcnt << 48);
+    uint64_t h2 = 0xcbf29ce484222325ULL ^ ((uint64_t)(uintptr_t)layout * 0x9e3779b97f4a7c15ULL) ^ bcnt;
+
+    for (uint16_t i = 0; i < bcnt; ++i) {
+        const SpirvBindingDesc &b = entry->bindings[i];
+        uint8_t ms = b.metal_slot;
+        VkWriteDescriptorSet &w = writes[i];
+        w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstBinding = b.binding;
+        w.dstArrayElement = 0;
+        w.descriptorCount = 1;
+
+        if (b.descriptor_type == SPIRV_VK_DESC_UNIFORM_BUFFER ||
+            b.descriptor_type == SPIRV_VK_DESC_STORAGE_BUFFER) {
+            w.descriptorType = (b.descriptor_type == SPIRV_VK_DESC_STORAGE_BUFFER)
+                                   ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                   : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            VkBuffer vbuf = st.dummy_buffer;
+            VkDeviceSize voff = 0;
+            VkDeviceSize vrange = VK_WHOLE_SIZE;
+            if (ms < kMaxBuffers && bindings.buffer_bound[ms] && bindings.buffer[ms] != VK_NULL_HANDLE) {
+                vbuf = bindings.buffer[ms];
+                voff = bindings.buffer_offset[ms];
+                vrange = (bindings.buffer_range[ms] > 0) ? bindings.buffer_range[ms] : VK_WHOLE_SIZE;
+                if (b.descriptor_type == SPIRV_VK_DESC_UNIFORM_BUFFER) {
+                    const uint64_t total_len = bindings.buffer_total_len[ms];
+                    const uint64_t avail = (total_len > voff) ? (total_len - voff) : 0ULL;
+                    const uint64_t max_ubo = 65536ULL;
+                    if (vrange == VK_WHOLE_SIZE || vrange > max_ubo) {
+                        vrange = (avail > 0) ? std::min<VkDeviceSize>(avail, max_ubo) : max_ubo;
+                    }
+                }
+            }
+            buf_infos[i] = {vbuf, voff, vrange};
+            w.pBufferInfo = &buf_infos[i];
+            mix_desc_hash(h1, h2, (uint64_t)(uintptr_t)vbuf ^ ((uint64_t)b.binding << 56), voff ^ (vrange << 17));
+        } else if (b.descriptor_type == SPIRV_VK_DESC_SAMPLER) {
+            w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            VkSampler vsmp = (ms < kMaxSamplers && bindings.sampler_bound[ms] && bindings.sampler[ms] != VK_NULL_HANDLE)
+                                 ? bindings.sampler[ms]
+                                 : st.dummy_sampler;
+            img_infos[i] = {vsmp, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+            w.pImageInfo = &img_infos[i];
+            mix_desc_hash(h1, h2, (uint64_t)(uintptr_t)vsmp, (uint64_t)b.binding | (2ULL << 32));
+        } else {
+            w.descriptorType = (b.descriptor_type == SPIRV_VK_DESC_STORAGE_IMAGE)
+                                   ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                   : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            VkImageView vview = b.is_depth ? st.dummy_depth_view : st.dummy_image_view;
+            if (ms < kMaxTextures && bindings.tex_bound[ms] && bindings.tex_view[ms] != VK_NULL_HANDLE) {
+                vview = bindings.tex_view[ms];
+            }
+            img_infos[i] = {
+                VK_NULL_HANDLE,
+                vview,
+                (b.descriptor_type == SPIRV_VK_DESC_STORAGE_IMAGE)
+                    ? VK_IMAGE_LAYOUT_GENERAL
+                    : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+            };
+            w.pImageInfo = &img_infos[i];
+            mix_desc_hash(h1, h2, (uint64_t)(uintptr_t)vview, (uint64_t)b.binding | (3ULL << 32));
+        }
+    }
+
+    DescCacheEntry &dce = slot.desc_cache[h1 & (kDescCacheSize - 1u)];
+    if (dce.epoch == slot.desc_cache_epoch &&
+        dce.layout == layout &&
+        dce.h1 == h1 &&
+        dce.h2 == h2 &&
+        dce.set != VK_NULL_HANDLE) {
+        st.prof_desc_hits.fetch_add(1, std::memory_order_relaxed);
+        return dce.set;
+    }
+    st.prof_desc_misses.fetch_add(1, std::memory_order_relaxed);
 
     VkDescriptorPool pool = (slot.active_desc_pool_idx == 0)
                                 ? slot.desc_pool
@@ -51,66 +139,18 @@ static VkDescriptorSet allocate_and_write_set(MtlCommandBufferImpl *cb,
         return VK_NULL_HANDLE;
     }
 
-    if (!entry || !entry->bindings || entry->binding_count == 0) {
-        return dset;
-    }
-
-    std::vector<VkDescriptorBufferInfo> buf_infos(entry->binding_count);
-    std::vector<VkDescriptorImageInfo> img_infos(entry->binding_count);
-    std::vector<VkWriteDescriptorSet> writes(entry->binding_count);
-
-    for (uint16_t i = 0; i < entry->binding_count; ++i) {
-        const SpirvBindingDesc &b = entry->bindings[i];
-        uint8_t ms = b.metal_slot;
-        VkWriteDescriptorSet &w = writes[i];
-        w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        w.dstSet = dset;
-        w.dstBinding = b.binding;
-        w.dstArrayElement = 0;
-        w.descriptorCount = 1;
-
-        if (b.descriptor_type == SPIRV_VK_DESC_UNIFORM_BUFFER ||
-            b.descriptor_type == SPIRV_VK_DESC_STORAGE_BUFFER) {
-            w.descriptorType = (b.descriptor_type == SPIRV_VK_DESC_STORAGE_BUFFER)
-                                   ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
-                                   : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            VkBuffer vbuf = st.dummy_buffer;
-            VkDeviceSize voff = 0;
-            VkDeviceSize vrange = VK_WHOLE_SIZE;
-            if (ms < kMaxBuffers && bindings.buffer_bound[ms] && bindings.buffer[ms] != VK_NULL_HANDLE) {
-                vbuf = bindings.buffer[ms];
-                voff = bindings.buffer_offset[ms];
-                vrange = (bindings.buffer_range[ms] > 0) ? bindings.buffer_range[ms] : VK_WHOLE_SIZE;
-            }
-            buf_infos[i] = {vbuf, voff, vrange};
-            w.pBufferInfo = &buf_infos[i];
-        } else if (b.descriptor_type == SPIRV_VK_DESC_SAMPLER) {
-            w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-            VkSampler vsmp = (ms < kMaxSamplers && bindings.sampler_bound[ms] && bindings.sampler[ms] != VK_NULL_HANDLE)
-                                 ? bindings.sampler[ms]
-                                 : st.dummy_sampler;
-            img_infos[i] = {vsmp, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
-            w.pImageInfo = &img_infos[i];
-        } else {
-            w.descriptorType = (b.descriptor_type == SPIRV_VK_DESC_STORAGE_IMAGE)
-                                   ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                   : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-            VkImageView vview = b.is_depth ? st.dummy_depth_view : st.dummy_image_view;
-            if (ms < kMaxTextures && bindings.tex_bound[ms] && bindings.tex_view[ms] != VK_NULL_HANDLE) {
-                vview = bindings.tex_view[ms];
-            }
-            img_infos[i] = {
-                VK_NULL_HANDLE,
-                vview,
-                (b.descriptor_type == SPIRV_VK_DESC_STORAGE_IMAGE)
-                    ? VK_IMAGE_LAYOUT_GENERAL
-                    : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-            };
-            w.pImageInfo = &img_infos[i];
+    if (bcnt > 0) {
+        for (uint16_t i = 0; i < bcnt; ++i) {
+            writes[i].dstSet = dset;
         }
+        vkUpdateDescriptorSets(st.vk_ctx.device(), static_cast<uint32_t>(bcnt), writes, 0, nullptr);
     }
 
-    vkUpdateDescriptorSets(st.vk_ctx.device(), static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    dce.layout = layout;
+    dce.set = dset;
+    dce.h1 = h1;
+    dce.h2 = h2;
+    dce.epoch = slot.desc_cache_epoch;
     return dset;
 }
 
@@ -170,8 +210,9 @@ static bool begin_render_pass_internal(MtlRenderEncoderImpl *re) {
         rai.loadOp = (ca.load_action == kMTLLoadActionClear) ? VK_ATTACHMENT_LOAD_OP_CLEAR :
                      (ca.load_action == kMTLLoadActionLoad)  ? VK_ATTACHMENT_LOAD_OP_LOAD :
                                                                VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        rai.storeOp = (ca.store_action == kMTLStoreActionDontCare) ? VK_ATTACHMENT_STORE_OP_DONT_CARE :
-                                                                     VK_ATTACHMENT_STORE_OP_STORE;
+        /* Always use STORE_OP_STORE so mid-pass suspends (fb_fetch / buffer-texture sync) and late
+           setColorStoreAction:atIndex: calls never discard render targets in tile memory. */
+        rai.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         rai.clearValue.color.float32[0] = (float)ca.clear_color.red;
         rai.clearValue.color.float32[1] = (float)ca.clear_color.green;
         rai.clearValue.color.float32[2] = (float)ca.clear_color.blue;
@@ -233,8 +274,9 @@ static bool begin_render_pass_internal(MtlRenderEncoderImpl *re) {
             dyn_depth.loadOp = (re->pass_desc.depth.load_action == kMTLLoadActionClear) ? VK_ATTACHMENT_LOAD_OP_CLEAR :
                                (re->pass_desc.depth.load_action == kMTLLoadActionLoad)  ? VK_ATTACHMENT_LOAD_OP_LOAD :
                                                                                          VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-            dyn_depth.storeOp = (re->pass_desc.depth.store_action == kMTLStoreActionDontCare) ? VK_ATTACHMENT_STORE_OP_DONT_CARE :
-                                                                                              VK_ATTACHMENT_STORE_OP_STORE;
+            /* Always store depth/stencil so mid-pass suspends (fb_fetch / buffer-texture sync) and late
+               setDepthStoreAction: calls never discard the 3D scene depth buffer! */
+            dyn_depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             dyn_depth.clearValue.depthStencil = {(float)re->pass_desc.depth.clear_depth, re->pass_desc.stencil.clear_stencil};
             fb_views.push_back(dview);
             fb_clears.push_back(dyn_depth.clearValue);
@@ -285,6 +327,32 @@ static bool begin_render_pass_internal(MtlRenderEncoderImpl *re) {
     }
 
     re->inside_render_pass = true;
+    re->bound_pipeline = VK_NULL_HANDLE;
+    re->bound_pso_obj = nullptr;
+    re->bound_dss_obj = nullptr;
+    re->bound_ptype = UINT64_MAX;
+    re->bound_cull = UINT64_MAX;
+    re->bound_wind = UINT64_MAX;
+    re->bound_fill = UINT64_MAX;
+    re->bound_set0 = VK_NULL_HANDLE;
+    re->bound_set0_layout = VK_NULL_HANDLE;
+    re->bound_set1 = VK_NULL_HANDLE;
+    re->bound_set1_layout = VK_NULL_HANDLE;
+    re->bound_pipe_layout = VK_NULL_HANDLE;
+    re->viewport_dirty = true;
+    re->scissor_dirty = true;
+    re->depth_bias_dirty = true;
+    re->blend_constants_dirty = true;
+    re->stencil_ref_dirty = true;
+    re->vs.desc_dirty = true;
+    re->vs.dirty_buf_mask = 0xFFFFFFFFu;
+    re->vs.dirty_tex_mask = 0xFFFFFFFFu;
+    re->vs.dirty_smp_mask = 0xFFFFFFFFu;
+    re->vs.vb_dirty_mask = 0xFFFFFFFFu;
+    re->ps.desc_dirty = true;
+    re->ps.dirty_buf_mask = 0xFFFFFFFFu;
+    re->ps.dirty_tex_mask = 0xFFFFFFFFu;
+    re->ps.dirty_smp_mask = 0xFFFFFFFFu;
     /* Set default negative-height viewport & full scissor immediately */
     VkViewport vp{};
     vp.x = 0.0f;
@@ -353,6 +421,13 @@ static void snapshot_color0_for_fb_fetch(MtlRenderEncoderImpl *re) {
     }
 
     VkCommandBuffer cmd = re->cmd_buf->cmd;
+    if (re->occ_query_active && re->cmd_buf) {
+        FrameSyncSlot &slot = st.frames[re->cmd_buf->frame_idx];
+        if (slot.occ_query_pool != VK_NULL_HANDLE) {
+            vkCmdEndQuery(cmd, slot.occ_query_pool, re->occ_active_qidx);
+        }
+        re->occ_query_active = false;
+    }
     if (st.vk_ctx.caps().dynamic_rendering && st.vk_ctx.cmd_end_rendering()) {
         st.vk_ctx.cmd_end_rendering()(cmd);
     } else {
@@ -388,6 +463,15 @@ static void snapshot_color0_for_fb_fetch(MtlRenderEncoderImpl *re) {
                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     if (lvl < c0_tex->mip_layouts.size()) c0_tex->mip_layouts[lvl] = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
+    VkMemoryBarrier att_mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    att_mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    att_mb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                           VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                         0, 1, &att_mb, 0, nullptr, 0, nullptr);
+
     uint64_t saved_color_loads[kMaxColorAttachments]{};
     for (uint32_t i = 0; i < kMaxColorAttachments; ++i) {
         saved_color_loads[i] = re->pass_desc.color[i].load_action;
@@ -398,6 +482,7 @@ static void snapshot_color0_for_fb_fetch(MtlRenderEncoderImpl *re) {
     re->pass_desc.depth.load_action = kMTLLoadActionLoad;
     re->pass_desc.stencil.load_action = kMTLLoadActionLoad;
 
+    st.prof_render_passes.fetch_add(1, std::memory_order_relaxed);
     begin_render_pass_internal(re);
 
     for (uint32_t i = 0; i < kMaxColorAttachments; ++i) {
@@ -410,6 +495,65 @@ static void snapshot_color0_for_fb_fetch(MtlRenderEncoderImpl *re) {
     re->ps.tex_obj[30] = nullptr;
     re->ps.tex_is_depth[30] = false;
     re->ps.tex_bound[30] = true;
+    re->ps.desc_dirty = true;
+    re->ps.dirty_tex_mask |= (1u << 30);
+}
+
+static void record_buffer_backed_texture_copy(VkCommandBuffer cmd, MtlTextureImpl *tex, MtlBufferImpl *buf) {
+    if (!tex || !buf || tex->image == VK_NULL_HANDLE || buf->buffer == VK_NULL_HANDLE) return;
+    uint32_t bw = 1, bh = 1;
+    uint32_t bsz = mtl_pixel_format_block_size(tex->vk_format, &bw, &bh);
+    if (bsz == 0) bsz = 4;
+
+    VkDeviceSize aligned_off = (bsz >= 4)
+                                   ? static_cast<VkDeviceSize>(tex->buffer_offset & ~static_cast<uint64_t>(bsz - 1))
+                                   : static_cast<VkDeviceSize>(tex->buffer_offset & ~3ULL);
+    if (aligned_off >= buf->length) return;
+    uint64_t avail = buf->length - aligned_off;
+
+    uint32_t buf_row_len = 0;
+    if (tex->buffer_bytes_per_row > 0) {
+        uint32_t row_texels = static_cast<uint32_t>((tex->buffer_bytes_per_row / bsz) * bw);
+        if (row_texels >= tex->width && row_texels <= 65536u) {
+            buf_row_len = row_texels;
+        }
+    }
+    uint64_t row_bytes = (buf_row_len > 0)
+                             ? (static_cast<uint64_t>(buf_row_len / bw) * bsz)
+                             : (static_cast<uint64_t>((tex->width + bw - 1u) / bw) * bsz);
+    if (row_bytes == 0) return;
+
+    uint32_t copy_w = tex->width;
+    uint32_t copy_h = tex->height;
+    if (tex->height > 1) {
+        copy_h = static_cast<uint32_t>(std::min<uint64_t>(tex->height, avail / row_bytes));
+        if (copy_h == 0 && avail >= bsz) {
+            copy_h = 1;
+            copy_w = std::min<uint32_t>(tex->width, static_cast<uint32_t>((avail / bsz) * bw));
+        }
+    } else {
+        copy_h = 1;
+        copy_w = std::min<uint32_t>(tex->width, static_cast<uint32_t>((avail / bsz) * bw));
+    }
+    if (copy_w == 0 || copy_h == 0) return;
+
+    VkImageLayout old_l = tex->mip_layouts.empty() ? VK_IMAGE_LAYOUT_UNDEFINED : tex->mip_layouts[0];
+    transition_image_layout(cmd, tex->image, tex->aspect_mask, 0, 1, 0, 1,
+                            old_l, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+    VkBufferImageCopy bic{};
+    bic.bufferOffset = aligned_off;
+    bic.bufferRowLength = (copy_h > 1) ? buf_row_len : 0;
+    bic.bufferImageHeight = 0;
+    bic.imageSubresource = {tex->aspect_mask, 0, 0, 1};
+    bic.imageOffset = {0, 0, 0};
+    bic.imageExtent = {copy_w, copy_h, 1};
+    vkCmdCopyBufferToImage(cmd, buf->buffer, tex->image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+
+    transition_image_layout(cmd, tex->image, tex->aspect_mask, 0, 1, 0, 1,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (!tex->mip_layouts.empty()) tex->mip_layouts[0] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
 static void flush_render_state(MtlRenderEncoderImpl *re, uint64_t primitive_type) {
@@ -421,19 +565,45 @@ static void flush_render_state(MtlRenderEncoderImpl *re, uint64_t primitive_type
     if (!pso) return;
 
     if (pso->ps && (pso->ps->flags & SPIRV_ENTRY_FLAG_FB_FETCH) != 0) {
-        snapshot_color0_for_fb_fetch(re);
+        if (!re->fb_fetch_snap_valid || re->fb_fetch_last_pso != re->pipeline_state_obj) {
+            st.prof_fb_snaps.fetch_add(1, std::memory_order_relaxed);
+            re->pass_fb_snaps++;
+            snapshot_color0_for_fb_fetch(re);
+            re->fb_fetch_snap_valid = true;
+            re->fb_fetch_last_pso = re->pipeline_state_obj;
+        }
+    } else {
+        re->fb_fetch_snap_valid = false;
+        re->fb_fetch_last_pso = nullptr;
     }
-
-    VkPipeline vk_pipe = get_or_create_specialized_graphics_pipeline(
-        pso, dss, primitive_type, re->cull_mode, re->front_winding, re->fill_mode,
-        re->color_formats, re->color_count, re->depth_format, re->stencil_format,
-        (st.vk_ctx.caps().dynamic_rendering && st.vk_ctx.cmd_begin_rendering()) ? VK_NULL_HANDLE : re->fallback_render_pass);
-    if (vk_pipe == VK_NULL_HANDLE) return;
+    re->pass_draws++;
 
     VkCommandBuffer cmd = re->cmd_buf->cmd;
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipe);
+    if (re->bound_pipeline == VK_NULL_HANDLE ||
+        re->bound_pso_obj != re->pipeline_state_obj ||
+        re->bound_dss_obj != re->depth_stencil_obj ||
+        re->bound_ptype != primitive_type ||
+        re->bound_cull != re->cull_mode ||
+        re->bound_wind != re->front_winding ||
+        re->bound_fill != re->fill_mode) {
+        VkPipeline vk_pipe = get_or_create_specialized_graphics_pipeline(
+            pso, dss, primitive_type, re->cull_mode, re->front_winding, re->fill_mode,
+            re->color_formats, re->color_count, re->depth_format, re->stencil_format,
+            (st.vk_ctx.caps().dynamic_rendering && st.vk_ctx.cmd_begin_rendering()) ? VK_NULL_HANDLE : re->fallback_render_pass);
+        if (vk_pipe == VK_NULL_HANDLE) return;
+        if (vk_pipe != re->bound_pipeline) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipe);
+            re->bound_pipeline = vk_pipe;
+        }
+        re->bound_pso_obj = re->pipeline_state_obj;
+        re->bound_dss_obj = re->depth_stencil_obj;
+        re->bound_ptype = primitive_type;
+        re->bound_cull = re->cull_mode;
+        re->bound_wind = re->front_winding;
+        re->bound_fill = re->fill_mode;
+    }
 
-    if (re->has_viewport) {
+    if (re->has_viewport && re->viewport_dirty) {
         VkViewport vp{};
         vp.x = (float)re->viewport.originX;
         vp.y = (float)(re->viewport.originY + re->viewport.height);
@@ -442,36 +612,88 @@ static void flush_render_state(MtlRenderEncoderImpl *re, uint64_t primitive_type
         vp.minDepth = (float)re->viewport.znear;
         vp.maxDepth = (float)re->viewport.zfar;
         vkCmdSetViewport(cmd, 0, 1, &vp);
+        re->viewport_dirty = false;
     }
 
-    if (re->has_scissor) {
+    if (re->has_scissor && re->scissor_dirty) {
         int32_t sx = (int32_t)std::min<uint64_t>(re->scissor.x, re->render_w > 0 ? re->render_w - 1 : 0);
         int32_t sy = (int32_t)std::min<uint64_t>(re->scissor.y, re->render_h > 0 ? re->render_h - 1 : 0);
         uint32_t sw = (uint32_t)std::min<uint64_t>(re->scissor.width, re->render_w - (uint32_t)sx);
         uint32_t sh = (uint32_t)std::min<uint64_t>(re->scissor.height, re->render_h - (uint32_t)sy);
         VkRect2D sc{{sx, sy}, {std::max(1u, sw), std::max(1u, sh)}};
         vkCmdSetScissor(cmd, 0, 1, &sc);
+        re->scissor_dirty = false;
     }
 
-    vkCmdSetDepthBias(cmd, re->depth_bias, re->depth_clamp, re->depth_slope);
-    vkCmdSetBlendConstants(cmd, re->blend_constants);
-    vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, re->stencil_ref);
+    if (re->depth_bias_dirty) {
+        vkCmdSetDepthBias(cmd, re->depth_bias, re->depth_clamp, re->depth_slope);
+        re->depth_bias_dirty = false;
+    }
+    if (re->blend_constants_dirty) {
+        vkCmdSetBlendConstants(cmd, re->blend_constants);
+        re->blend_constants_dirty = false;
+    }
+    if (re->stencil_ref_dirty) {
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, re->stencil_ref);
+        re->stencil_ref_dirty = false;
+    }
 
-    /* Bind vertex streams referenced by MTLVertexDescriptor */
-    for (uint32_t b = 0; b < 31; ++b) {
-        if ((pso->vertex_buffer_mask & (1u << b)) && re->vs.buffer_bound[b] && re->vs.buffer[b] != VK_NULL_HANDLE) {
+    /* Bind only dirty vertex streams referenced by MTLVertexDescriptor */
+    uint32_t vb_mask = pso->vertex_buffer_mask & re->vs.vb_dirty_mask;
+    while (vb_mask != 0) {
+        uint32_t b = (uint32_t)__builtin_ctz(vb_mask);
+        vb_mask &= ~(1u << b);
+        if (b < 31 && re->vs.buffer_bound[b] && re->vs.buffer[b] != VK_NULL_HANDLE) {
             VkBuffer vb = re->vs.buffer[b];
             VkDeviceSize voff = re->vs.buffer_offset[b];
             vkCmdBindVertexBuffers(cmd, b, 1, &vb, &voff);
+            re->vs.vb_dirty_mask &= ~(1u << b);
         }
     }
 
-    /* Allocate & bind Set 0 (VS) and Set 1 (PS) */
-    VkDescriptorSet set0 = allocate_and_write_set(re->cmd_buf, pso->set0_layout, pso->vs, re->vs);
-    VkDescriptorSet set1 = allocate_and_write_set(re->cmd_buf, pso->set1_layout, pso->ps, re->ps);
-    VkDescriptorSet sets[2] = {set0, set1};
-    if (set0 != VK_NULL_HANDLE && set1 != VK_NULL_HANDLE) {
+    /* Overflow fallback if hardware occlusion query pool was exhausted */
+    if (!re->occ_query_active && re->vis_mode != 0 && re->pass_desc.visibility_result_buffer_obj != nullptr) {
+        uint64_t vis_val = (re->vis_mode == 2) ? 1000ULL : 1ULL;
+        if (re->vis_writes.empty() || re->vis_writes.back().first != re->vis_offset) {
+            re->vis_writes.push_back({re->vis_offset, vis_val});
+        }
+    }
+
+    /* Allocate & bind Set 0 (VS) and Set 1 (PS) only when a slot used by this shader changed or layout changed */
+    const bool vs_used_dirty = ((re->vs.dirty_buf_mask & pso->vs_used_buf_mask) != 0) ||
+                               ((re->vs.dirty_tex_mask & pso->vs_used_tex_mask) != 0) ||
+                               ((re->vs.dirty_smp_mask & pso->vs_used_smp_mask) != 0);
+    const bool ps_used_dirty = ((re->ps.dirty_buf_mask & pso->ps_used_buf_mask) != 0) ||
+                               ((re->ps.dirty_tex_mask & pso->ps_used_tex_mask) != 0) ||
+                               ((re->ps.dirty_smp_mask & pso->ps_used_smp_mask) != 0);
+    const bool need_set0 = vs_used_dirty || (pso->set0_layout != re->bound_set0_layout) || (re->bound_set0 == VK_NULL_HANDLE);
+    const bool need_set1 = ps_used_dirty || (pso->set1_layout != re->bound_set1_layout) || (re->bound_set1 == VK_NULL_HANDLE);
+    const bool layout_changed = (pso->pipeline_layout != re->bound_pipe_layout);
+
+    VkDescriptorSet prev_set0 = re->bound_set0;
+    VkDescriptorSet prev_set1 = re->bound_set1;
+
+    if (need_set0) {
+        re->bound_set0 = allocate_and_write_set(re->cmd_buf, pso->set0_layout, pso->vs, re->vs);
+        re->bound_set0_layout = pso->set0_layout;
+        re->vs.dirty_buf_mask &= ~pso->vs_used_buf_mask;
+        re->vs.dirty_tex_mask &= ~pso->vs_used_tex_mask;
+        re->vs.dirty_smp_mask &= ~pso->vs_used_smp_mask;
+        re->vs.desc_dirty = false;
+    }
+    if (need_set1) {
+        re->bound_set1 = allocate_and_write_set(re->cmd_buf, pso->set1_layout, pso->ps, re->ps);
+        re->bound_set1_layout = pso->set1_layout;
+        re->ps.dirty_buf_mask &= ~pso->ps_used_buf_mask;
+        re->ps.dirty_tex_mask &= ~pso->ps_used_tex_mask;
+        re->ps.dirty_smp_mask &= ~pso->ps_used_smp_mask;
+        re->ps.desc_dirty = false;
+    }
+    if ((re->bound_set0 != prev_set0 || re->bound_set1 != prev_set1 || layout_changed) &&
+        re->bound_set0 != VK_NULL_HANDLE && re->bound_set1 != VK_NULL_HANDLE) {
+        VkDescriptorSet sets[2] = {re->bound_set0, re->bound_set1};
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pso->pipeline_layout, 0, 2, sets, 0, nullptr);
+        re->bound_pipe_layout = pso->pipeline_layout;
     }
 }
 
@@ -502,6 +724,9 @@ static void mtl_re_dealloc(void *self) {
     }
     if (re->pass_desc.stencil.texture_obj) {
         oh2_objc_release_object(re->pass_desc.stencil.texture_obj);
+    }
+    if (re->pass_desc.visibility_result_buffer_obj) {
+        oh2_objc_release_object(re->pass_desc.visibility_result_buffer_obj);
     }
     get_state().live_encoders.fetch_sub(1, std::memory_order_relaxed);
     delete re;
@@ -538,7 +763,34 @@ static void *mtl_cb_renderEncoder(void *self, const char *sel, void *rpd_obj) {
     if (re->pass_desc.stencil.texture_obj) {
         oh2_objc_add_refcount(re->pass_desc.stencil.texture_obj, 1);
     }
+    if (re->pass_desc.visibility_result_buffer_obj) {
+        oh2_objc_add_refcount(re->pass_desc.visibility_result_buffer_obj, 1);
+    }
+    if (check_begin_cb(cb)) {
+        mtl_flush_pending_tex_uploads_cmd(cb);
+        mtl_sync_all_dirty_buffer_textures_cmd(cb);
+        FrameSyncSlot &slot = get_state().frames[cb->frame_idx];
+        if (slot.ts_capturing && slot.ts_query_pool != VK_NULL_HANDLE &&
+            slot.ts_query_cursor + 2 <= kMaxTimestampQueriesPerCB) {
+            TsPassRecord rec{};
+            rec.start_q = slot.ts_query_cursor++;
+            rec.end_q = rec.start_q;
+            vkCmdWriteTimestamp(cb->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, slot.ts_query_pool, rec.start_q);
+            re->ts_pass_idx = (uint32_t)slot.ts_passes.size();
+            slot.ts_passes.push_back(rec);
+        }
+    }
+    get_state().prof_render_passes.fetch_add(1, std::memory_order_relaxed);
     begin_render_pass_internal(re);
+    if (re->ts_pass_idx != UINT32_MAX) {
+        FrameSyncSlot &slot = get_state().frames[cb->frame_idx];
+        if (re->ts_pass_idx < slot.ts_passes.size()) {
+            slot.ts_passes[re->ts_pass_idx].w = re->render_w;
+            slot.ts_passes[re->ts_pass_idx].h = re->render_h;
+            slot.ts_passes[re->ts_pass_idx].c_cnt = re->color_count;
+            slot.ts_passes[re->ts_pass_idx].dfmt = (int)re->depth_format;
+        }
+    }
     get_state().live_encoders.fetch_add(1, std::memory_order_relaxed);
     return alloc_mtl_wrap_managed("MTLRenderCommandEncoder", re, &mtl_re_dealloc, true);
 }
@@ -548,14 +800,27 @@ static void mtl_re_setDSS(void *s, const char *sel, void *dss) { (void)sel; if (
 static void mtl_re_setCull(void *s, const char *sel, uint64_t m) { (void)sel; if (auto *re = unwrap_mtl<MtlRenderEncoderImpl>(s)) re->cull_mode = m; }
 static void mtl_re_setWind(void *s, const char *sel, uint64_t w) { (void)sel; if (auto *re = unwrap_mtl<MtlRenderEncoderImpl>(s)) re->front_winding = w; }
 static void mtl_re_setFill(void *s, const char *sel, uint64_t m) { (void)sel; if (auto *re = unwrap_mtl<MtlRenderEncoderImpl>(s)) re->fill_mode = m; }
-static void mtl_re_setStencilRef(void *s, const char *sel, uint32_t v) { (void)sel; if (auto *re = unwrap_mtl<MtlRenderEncoderImpl>(s)) re->stencil_ref = v; }
-static void mtl_re_setStencilFB(void *s, const char *sel, uint32_t f, uint32_t b) { (void)sel; (void)b; if (auto *re = unwrap_mtl<MtlRenderEncoderImpl>(s)) re->stencil_ref = f; }
+static void mtl_re_setStencilRef(void *s, const char *sel, uint32_t v) {
+    (void)sel;
+    if (auto *re = unwrap_mtl<MtlRenderEncoderImpl>(s)) {
+        if (re->stencil_ref != v) { re->stencil_ref = v; re->stencil_ref_dirty = true; }
+    }
+}
+static void mtl_re_setStencilFB(void *s, const char *sel, uint32_t f, uint32_t b) {
+    (void)sel; (void)b;
+    if (auto *re = unwrap_mtl<MtlRenderEncoderImpl>(s)) {
+        if (re->stencil_ref != f) { re->stencil_ref = f; re->stencil_ref_dirty = true; }
+    }
+}
 static void mtl_re_setDepthBias(void *s, const char *sel, float b, float sl, float cl) {
     (void)sel;
     if (auto *re = unwrap_mtl<MtlRenderEncoderImpl>(s)) {
-        re->depth_bias = b;
-        re->depth_slope = sl;
-        re->depth_clamp = cl;
+        if (re->depth_bias != b || re->depth_slope != sl || re->depth_clamp != cl) {
+            re->depth_bias = b;
+            re->depth_slope = sl;
+            re->depth_clamp = cl;
+            re->depth_bias_dirty = true;
+        }
     }
 }
 
@@ -564,6 +829,7 @@ static void mtl_re_setViewport(void *s, const char *sel, MTLViewport *vp) {
     if (auto *re = unwrap_mtl<MtlRenderEncoderImpl>(s); re && vp) {
         re->viewport = *vp;
         re->has_viewport = true;
+        re->viewport_dirty = true;
     }
 }
 static void mtl_re_setViewports(void *s, const char *sel, MTLViewport *vps, uint64_t cnt) {
@@ -575,6 +841,7 @@ static void mtl_re_setScissor(void *s, const char *sel, MTLScissorRect *sr) {
     if (auto *re = unwrap_mtl<MtlRenderEncoderImpl>(s); re && sr) {
         re->scissor = *sr;
         re->has_scissor = true;
+        re->scissor_dirty = true;
     }
 }
 static void mtl_re_setScissors(void *s, const char *sel, MTLScissorRect *srs, uint64_t cnt) {
@@ -586,23 +853,38 @@ static void bind_stage_buffer(MtlStageBindings &sb, uint64_t idx, void *buf_obj,
     if (idx >= kMaxBuffers) return;
     auto *b = unwrap_mtl<MtlBufferImpl>(buf_obj);
     if (b && b->buffer != VK_NULL_HANDLE) {
+        if (sb.buffer_bound[idx] && sb.buffer[idx] == b->buffer && sb.buffer_offset[idx] == off && sb.buffer_total_len[idx] == b->length) {
+            return;
+        }
         sb.buffer[idx] = b->buffer;
         sb.buffer_offset[idx] = off;
         sb.buffer_total_len[idx] = b->length;
         sb.buffer_range[idx] = (b->length > off) ? (b->length - off) : VK_WHOLE_SIZE;
+        sb.buffer_mapped[idx] = static_cast<uint8_t *>(b->mapped);
+        sb.buffer_obj[idx] = buf_obj;
         sb.buffer_bound[idx] = true;
     } else {
+        if (!sb.buffer_bound[idx]) return;
         sb.buffer_total_len[idx] = 0;
+        sb.buffer_mapped[idx] = nullptr;
+        sb.buffer_obj[idx] = nullptr;
         sb.buffer_bound[idx] = false;
     }
+    sb.desc_dirty = true;
+    sb.dirty_buf_mask |= (1u << idx);
+    sb.vb_dirty_mask |= (1u << idx);
 }
 
 static void set_stage_buffer_offset(MtlStageBindings &sb, uint64_t idx, uint64_t off) {
     if (idx >= kMaxBuffers) return;
+    if (sb.buffer_offset[idx] == off) return;
     sb.buffer_offset[idx] = off;
     if (sb.buffer_total_len[idx] > 0) {
         sb.buffer_range[idx] = (sb.buffer_total_len[idx] > off) ? (sb.buffer_total_len[idx] - off) : VK_WHOLE_SIZE;
     }
+    sb.desc_dirty = true;
+    sb.dirty_buf_mask |= (1u << idx);
+    sb.vb_dirty_mask |= (1u << idx);
 }
 
 static void bind_stage_bytes(MtlCommandBufferImpl *cb, MtlStageBindings &sb, const void *ptr, uint64_t len, uint64_t idx) {
@@ -614,7 +896,12 @@ static void bind_stage_bytes(MtlCommandBufferImpl *cb, MtlStageBindings &sb, con
         sb.buffer_offset[idx] = voff;
         sb.buffer_total_len[idx] = voff + len;
         sb.buffer_range[idx] = len;
+        sb.buffer_mapped[idx] = nullptr;
+        sb.buffer_obj[idx] = nullptr;
         sb.buffer_bound[idx] = true;
+        sb.desc_dirty = true;
+        sb.dirty_buf_mask |= (1u << idx);
+        sb.vb_dirty_mask |= (1u << idx);
     }
 }
 
@@ -622,25 +909,33 @@ static void bind_stage_texture(MtlStageBindings &sb, uint64_t idx, void *tex_obj
     if (idx >= kMaxTextures) return;
     auto *t = unwrap_mtl<MtlTextureImpl>(tex_obj);
     if (t && t->view != VK_NULL_HANDLE) {
+        if (sb.tex_bound[idx] && sb.tex_view[idx] == t->view) return;
         sb.tex_view[idx] = t->view;
         sb.tex_obj[idx] = tex_obj;
         sb.tex_is_depth[idx] = (t->aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
         sb.tex_bound[idx] = true;
     } else {
+        if (!sb.tex_bound[idx]) return;
         sb.tex_obj[idx] = nullptr;
         sb.tex_bound[idx] = false;
     }
+    sb.desc_dirty = true;
+    sb.dirty_tex_mask |= (1u << idx);
 }
 
 static void bind_stage_sampler(MtlStageBindings &sb, uint64_t idx, void *smp_obj) {
     if (idx >= kMaxSamplers) return;
     auto *smp = unwrap_mtl<MtlSamplerImpl>(smp_obj);
     if (smp && smp->sampler != VK_NULL_HANDLE) {
+        if (sb.sampler_bound[idx] && sb.sampler[idx] == smp->sampler) return;
         sb.sampler[idx] = smp->sampler;
         sb.sampler_bound[idx] = true;
     } else {
+        if (!sb.sampler_bound[idx]) return;
         sb.sampler_bound[idx] = false;
     }
+    sb.desc_dirty = true;
+    sb.dirty_smp_mask |= (1u << idx);
 }
 
 static void mtl_re_setVB(void *s, const char *sel, void *b, uint64_t off, uint64_t idx) {
@@ -717,12 +1012,93 @@ static void mtl_re_endEncoding(void *s, const char *sel) {
     MtlVkState &st = get_state();
     auto *re = unwrap_mtl<MtlRenderEncoderImpl>(s);
     if (!re || !re->inside_render_pass) return;
+    if (re->occ_query_active && re->cmd_buf) {
+        FrameSyncSlot &slot = st.frames[re->cmd_buf->frame_idx];
+        if (slot.occ_query_pool != VK_NULL_HANDLE) {
+            vkCmdEndQuery(re->cmd_buf->cmd, slot.occ_query_pool, re->occ_active_qidx);
+        }
+        re->occ_query_active = false;
+    }
     if (st.vk_ctx.caps().dynamic_rendering && st.vk_ctx.cmd_end_rendering()) {
         st.vk_ctx.cmd_end_rendering()(re->cmd_buf->cmd);
     } else {
         vkCmdEndRenderPass(re->cmd_buf->cmd);
     }
     re->inside_render_pass = false;
+
+    if (re->ts_pass_idx != UINT32_MAX && re->cmd_buf) {
+        FrameSyncSlot &slot = st.frames[re->cmd_buf->frame_idx];
+        if (slot.ts_capturing && slot.ts_query_pool != VK_NULL_HANDLE &&
+            re->ts_pass_idx < slot.ts_passes.size() &&
+            slot.ts_query_cursor < kMaxTimestampQueriesPerCB) {
+            uint32_t eq = slot.ts_query_cursor++;
+            vkCmdWriteTimestamp(re->cmd_buf->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, slot.ts_query_pool, eq);
+            auto &rec = slot.ts_passes[re->ts_pass_idx];
+            rec.end_q = eq;
+            rec.draws = re->pass_draws;
+            rec.fb_snaps = re->pass_fb_snaps;
+            rec.occs = (uint32_t)re->occ_queries.size();
+        }
+        re->ts_pass_idx = UINT32_MAX;
+    }
+
+    /* Copy hardware occlusion query results into visibilityResultBuffer outside render pass */
+    if ((!re->occ_queries.empty() || !re->vis_writes.empty()) && re->pass_desc.visibility_result_buffer_obj) {
+        auto *vbuf = unwrap_mtl<MtlBufferImpl>(re->pass_desc.visibility_result_buffer_obj);
+        if (vbuf && vbuf->buffer != VK_NULL_HANDLE) {
+            FrameSyncSlot &slot = st.frames[re->cmd_buf->frame_idx];
+            bool any_updated = false;
+            if (slot.occ_query_pool != VK_NULL_HANDLE) {
+                const size_t nq = re->occ_queries.size();
+                size_t qi = 0;
+                while (qi < nq) {
+                    uint32_t start_q = re->occ_queries[qi].first;
+                    uint64_t start_off = re->occ_queries[qi].second;
+                    if ((start_off & 7ULL) != 0 || start_off + sizeof(uint64_t) > vbuf->length) {
+                        qi++;
+                        continue;
+                    }
+                    uint32_t run = 1;
+                    while (qi + run < nq) {
+                        uint32_t nq_id = re->occ_queries[qi + run].first;
+                        uint64_t nq_off = re->occ_queries[qi + run].second;
+                        if (nq_id == start_q + run && nq_off == start_off + (uint64_t)run * sizeof(uint64_t) &&
+                            nq_off + sizeof(uint64_t) <= vbuf->length) {
+                            run++;
+                        } else {
+                            break;
+                        }
+                    }
+                    vkCmdCopyQueryPoolResults(
+                        re->cmd_buf->cmd, slot.occ_query_pool, start_q, run,
+                        vbuf->buffer, start_off, sizeof(uint64_t),
+                        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                    any_updated = true;
+                    qi += run;
+                }
+            }
+            for (const auto &vw : re->vis_writes) {
+                uint64_t off = vw.first;
+                uint64_t val = vw.second;
+                if ((off & 3ULL) == 0 && off + sizeof(uint64_t) <= vbuf->length) {
+                    vkCmdUpdateBuffer(re->cmd_buf->cmd, vbuf->buffer, off, sizeof(uint64_t), &val);
+                    any_updated = true;
+                }
+            }
+            if (any_updated) {
+                vbuf->needs_host_invalidate.store(true, std::memory_order_release);
+                VkMemoryBarrier vmb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                vmb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                vmb.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+                vkCmdPipelineBarrier(re->cmd_buf->cmd,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                     0, 1, &vmb, 0, nullptr, 0, nullptr);
+            }
+        }
+        re->occ_queries.clear();
+        re->vis_writes.clear();
+    }
 
     for (VkImageView v : re->attachment_views_to_destroy) {
         enqueue_deferred_view(v);
@@ -808,7 +1184,7 @@ static void mtl_re_endEncoding(void *s, const char *sel) {
 
     if (re->pass_desc.depth.texture_obj) {
         auto *dtex = unwrap_mtl<MtlTextureImpl>(re->pass_desc.depth.texture_obj);
-        if (dtex && dtex->image != VK_NULL_HANDLE && re->pass_desc.depth.store_action != kMTLStoreActionDontCare) {
+        if (dtex && dtex->image != VK_NULL_HANDLE) {
             uint32_t dlvl = (uint32_t)re->pass_desc.depth.level;
             uint32_t dslc = (uint32_t)re->pass_desc.depth.slice;
             if (re->pass_desc.depth.resolve_texture_obj && re->pass_desc.depth.resolve_texture_obj != re->pass_desc.depth.texture_obj) {
@@ -886,13 +1262,46 @@ static void mtl_re_setStencilStoreAction(void *s, const char *sel, uint64_t acti
     (void)sel;
     if (auto *re = unwrap_mtl<MtlRenderEncoderImpl>(s)) re->pass_desc.stencil.store_action = action;
 }
+static void mtl_re_setVisResultMode(void *s, const char *sel, uint64_t mode, uint64_t offset) {
+    (void)sel;
+    auto *re = unwrap_mtl<MtlRenderEncoderImpl>(s);
+    if (!re) return;
+    MtlVkState &st = get_state();
+    if (re->occ_query_active && re->cmd_buf) {
+        FrameSyncSlot &slot = st.frames[re->cmd_buf->frame_idx];
+        if (slot.occ_query_pool != VK_NULL_HANDLE) {
+            vkCmdEndQuery(re->cmd_buf->cmd, slot.occ_query_pool, re->occ_active_qidx);
+        }
+        re->occ_query_active = false;
+    }
+    re->vis_mode = mode;
+    re->vis_offset = offset;
+    if (mode != 0 && re->inside_render_pass && re->cmd_buf && re->pass_desc.visibility_result_buffer_obj) {
+        FrameSyncSlot &slot = st.frames[re->cmd_buf->frame_idx];
+        if (slot.occ_query_pool != VK_NULL_HANDLE && slot.occ_query_cursor < kMaxOcclusionQueriesPerCB) {
+            uint32_t qidx = slot.occ_query_cursor++;
+            VkQueryControlFlags qflags = (mode == 2 && st.vk_ctx.caps().supported_features.occlusionQueryPrecise)
+                                             ? VK_QUERY_CONTROL_PRECISE_BIT
+                                             : 0;
+            vkCmdBeginQuery(re->cmd_buf->cmd, slot.occ_query_pool, qidx, qflags);
+            re->occ_query_active = true;
+            re->occ_active_qidx = qidx;
+            re->occ_queries.push_back({qidx, offset});
+            st.prof_occ_queries.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
 static void mtl_re_setBlendColor(void *s, const char *sel, float r, float g, float b, float a) {
     (void)sel;
     if (auto *re = unwrap_mtl<MtlRenderEncoderImpl>(s)) {
-        re->blend_constants[0] = r;
-        re->blend_constants[1] = g;
-        re->blend_constants[2] = b;
-        re->blend_constants[3] = a;
+        if (re->blend_constants[0] != r || re->blend_constants[1] != g ||
+            re->blend_constants[2] != b || re->blend_constants[3] != a) {
+            re->blend_constants[0] = r;
+            re->blend_constants[1] = g;
+            re->blend_constants[2] = b;
+            re->blend_constants[3] = a;
+            re->blend_constants_dirty = true;
+        }
     }
 }
 
@@ -1035,6 +1444,8 @@ static void mtl_ce_dispatchTG(void *s, const char *sel, MTLSize *tgs, MTLSize *t
     (void)sel; (void)tptg;
     auto *ce = unwrap_mtl<MtlComputeEncoderImpl>(s);
     if (!ce || !check_begin_cb(ce->cmd_buf) || !ce->pipeline_state_obj || !tgs) return;
+    mtl_flush_pending_tex_uploads_cmd(ce->cmd_buf);
+    mtl_sync_all_dirty_buffer_textures_cmd(ce->cmd_buf);
     auto *cpso = unwrap_mtl<MtlComputePipelineStateImpl>(ce->pipeline_state_obj);
     if (!cpso || cpso->pipeline == VK_NULL_HANDLE) return;
 
@@ -1042,8 +1453,19 @@ static void mtl_ce_dispatchTG(void *s, const char *sel, MTLSize *tgs, MTLSize *t
     for (uint64_t k = 0; k < kMaxTextures; ++k) {
         if (!ce->cs.tex_bound[k] || !ce->cs.tex_obj[k]) continue;
         auto *t = unwrap_mtl<MtlTextureImpl>(ce->cs.tex_obj[k]);
-        if (t && t->image != VK_NULL_HANDLE && !t->mip_layouts.empty() &&
-            t->mip_layouts[0] != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        if (!t || t->image == VK_NULL_HANDLE) continue;
+        if (t->parent_buffer_obj) {
+            auto *buf = unwrap_mtl<MtlBufferImpl>(t->parent_buffer_obj);
+            if (buf && buf->buffer != VK_NULL_HANDLE) {
+                uint64_t bgen = buf->mod_gen.load(std::memory_order_relaxed);
+                if (t->synced_cmd_seq != ce->cmd_buf->cmd_seq_id || t->synced_buf_gen != bgen) {
+                    record_buffer_backed_texture_copy(cmd, t, buf);
+                    t->synced_cmd_seq = ce->cmd_buf->cmd_seq_id;
+                    t->synced_buf_gen = bgen;
+                }
+            }
+        } else if (!t->mip_layouts.empty() &&
+                   t->mip_layouts[0] != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
             transition_image_layout(cmd, t->image, t->aspect_mask, 0, t->mip_levels, 0, t->array_layers,
                                     t->mip_layouts[0], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             for (auto &ml : t->mip_layouts) ml = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -1059,6 +1481,14 @@ static void mtl_ce_dispatchTG(void *s, const char *sel, MTLSize *tgs, MTLSize *t
     uint32_t gy = (uint32_t)std::max<uint64_t>(1, tgs->height);
     uint32_t gz = (uint32_t)std::max<uint64_t>(1, tgs->depth);
     vkCmdDispatch(cmd, gx, gy, gz);
+
+    for (uint32_t b = 0; b < kMaxBuffers; ++b) {
+        if (ce->cs.buffer_bound[b] && ce->cs.buffer_obj[b]) {
+            if (auto *bi = unwrap_mtl<MtlBufferImpl>(ce->cs.buffer_obj[b])) {
+                bi->mod_gen.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
 
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1133,7 +1563,9 @@ static void *mtl_cb_blitEncoder(void *self, const char *sel) {
     (void)sel;
     auto *cb = unwrap_mtl<MtlCommandBufferImpl>(self);
     if (!cb) return nullptr;
-    check_begin_cb(cb);
+    if (check_begin_cb(cb)) {
+        mtl_flush_pending_tex_uploads_cmd(cb);
+    }
     auto *be = new MtlBlitEncoderImpl();
     be->cmd_buf_obj = self;
     be->cmd_buf = cb;
@@ -1150,6 +1582,24 @@ static void mtl_be_copyBuf(void *s, const char *sel, void *src_obj, uint64_t src
     if (!be || !check_begin_cb(be->cmd_buf) || !src || !dst || size == 0) return;
     VkBufferCopy reg{src_off, dst_off, size};
     vkCmdCopyBuffer(be->cmd_buf->cmd, src->buffer, dst->buffer, 1, &reg);
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                       VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                       VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
+                       VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+    vkCmdPipelineBarrier(be->cmd_buf->cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+    dst->mod_gen.fetch_add(1, std::memory_order_relaxed);
+    for (MtlTextureImpl *vt : dst->buffer_views) {
+        if (vt && vt->buffer_offset < dst_off + size) {
+            record_buffer_backed_texture_copy(be->cmd_buf->cmd, vt, dst);
+        }
+    }
     get_state().blit_commands.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -1160,6 +1610,19 @@ static void mtl_be_fillBuf(void *s, const char *sel, void *buf_obj, NSRange64 ra
     if (!be || !check_begin_cb(be->cmd_buf) || !buf || range.length == 0) return;
     uint32_t fill32 = (uint32_t)val | ((uint32_t)val << 8) | ((uint32_t)val << 16) | ((uint32_t)val << 24);
     vkCmdFillBuffer(be->cmd_buf->cmd, buf->buffer, range.location, range.length, fill32);
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                       VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                       VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
+                       VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+    vkCmdPipelineBarrier(be->cmd_buf->cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+    buf->mod_gen.fetch_add(1, std::memory_order_relaxed);
     get_state().blit_commands.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -1184,6 +1647,7 @@ static void mtl_be_copyTexToBuf(void *s, const char *sel, void *src_obj, uint64_
     bic.imageOffset = {(int32_t)src_org->x, (int32_t)src_org->y, (int32_t)src_org->z};
     bic.imageExtent = {(uint32_t)src_sz->width, (uint32_t)src_sz->height, (uint32_t)std::max<uint64_t>(1, src_sz->depth)};
     vkCmdCopyImageToBuffer(cmd, tex->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf->buffer, 1, &bic);
+    buf->mod_gen.fetch_add(1, std::memory_order_relaxed);
 
     VkImageLayout restore_l = (old_l != VK_IMAGE_LAYOUT_UNDEFINED) ? old_l : VK_IMAGE_LAYOUT_GENERAL;
     transition_image_layout(cmd, tex->image, tex->aspect_mask, lvl, 1, slc, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, restore_l);
@@ -1302,7 +1766,60 @@ static void mtl_be_copyTexToTex(void *s, const char *sel, void *src_obj, uint64_
 }
 
 static void mtl_be_genMipmaps(void *s, const char *sel, void *tex_obj) {
-    (void)sel; (void)s; (void)tex_obj;
+    (void)sel;
+    auto *be = unwrap_mtl<MtlBlitEncoderImpl>(s);
+    auto *tex = unwrap_mtl<MtlTextureImpl>(tex_obj);
+    if (!be || !check_begin_cb(be->cmd_buf) || !tex || tex->image == VK_NULL_HANDLE || tex->mip_levels <= 1) return;
+
+    VkCommandBuffer cmd = be->cmd_buf->cmd;
+    VkImageLayout l0 = tex->mip_layouts.empty() ? VK_IMAGE_LAYOUT_UNDEFINED : tex->mip_layouts[0];
+    if (l0 == VK_IMAGE_LAYOUT_UNDEFINED) {
+        for (uint32_t m = 0; m < tex->mip_levels; ++m) {
+            transition_image_layout(cmd, tex->image, tex->aspect_mask, m, 1, 0, tex->array_layers,
+                                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            if (m < tex->mip_layouts.size()) tex->mip_layouts[m] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+        return;
+    }
+
+    transition_image_layout(cmd, tex->image, tex->aspect_mask, 0, 1, 0, tex->array_layers,
+                            l0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    for (uint32_t m = 1; m < tex->mip_levels; ++m) {
+        VkImageLayout lm = (m < tex->mip_layouts.size()) ? tex->mip_layouts[m] : VK_IMAGE_LAYOUT_UNDEFINED;
+        transition_image_layout(cmd, tex->image, tex->aspect_mask, m, 1, 0, tex->array_layers,
+                                lm, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+        int32_t sw = (int32_t)std::max(1u, tex->width >> (m - 1));
+        int32_t sh = (int32_t)std::max(1u, tex->height >> (m - 1));
+        int32_t sd = (int32_t)std::max(1u, tex->depth >> (m - 1));
+        int32_t dw = (int32_t)std::max(1u, tex->width >> m);
+        int32_t dh = (int32_t)std::max(1u, tex->height >> m);
+        int32_t dd = (int32_t)std::max(1u, tex->depth >> m);
+
+        VkImageBlit ib{};
+        ib.srcSubresource = {tex->aspect_mask, m - 1, 0, tex->array_layers};
+        ib.srcOffsets[1] = {sw, sh, sd};
+        ib.dstSubresource = {tex->aspect_mask, m, 0, tex->array_layers};
+        ib.dstOffsets[1] = {dw, dh, dd};
+        vkCmdBlitImage(cmd,
+                       tex->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &ib, VK_FILTER_LINEAR);
+
+        transition_image_layout(cmd, tex->image, tex->aspect_mask, m - 1, 1, 0, tex->array_layers,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (m - 1 < tex->mip_layouts.size()) tex->mip_layouts[m - 1] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        if (m + 1 < tex->mip_levels) {
+            transition_image_layout(cmd, tex->image, tex->aspect_mask, m, 1, 0, tex->array_layers,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        } else {
+            transition_image_layout(cmd, tex->image, tex->aspect_mask, m, 1, 0, tex->array_layers,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            if (m < tex->mip_layouts.size()) tex->mip_layouts[m] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+    }
     get_state().blit_commands.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -1372,7 +1889,7 @@ void register_encoder_objc_methods() {
     oh2_objc_register_instance_method("MTLRenderCommandEncoder", "setFragmentSamplerStates:lodMinClamps:lodMaxClamps:withRange:", (void *)&mtl_re_setFSsClamps);
     oh2_objc_register_instance_method("MTLRenderCommandEncoder", "setDepthClipMode:",             (void *)&mtl_enc_noop_u64);
     oh2_objc_register_instance_method("MTLRenderCommandEncoder", "setBlendColorRed:green:blue:alpha:", (void *)&mtl_re_setBlendColor);
-    oh2_objc_register_instance_method("MTLRenderCommandEncoder", "setVisibilityResultMode:offset:", (void *)&mtl_enc_noop_u64_u64);
+    oh2_objc_register_instance_method("MTLRenderCommandEncoder", "setVisibilityResultMode:offset:", (void *)&mtl_re_setVisResultMode);
     oh2_objc_register_instance_method("MTLRenderCommandEncoder", "setDepthStoreAction:",          (void *)&mtl_re_setDepthStoreAction);
     oh2_objc_register_instance_method("MTLRenderCommandEncoder", "setStencilStoreAction:",        (void *)&mtl_re_setStencilStoreAction);
     oh2_objc_register_instance_method("MTLRenderCommandEncoder", "setDepthStoreActionOptions:",   (void *)&mtl_enc_noop_u64);

@@ -2,9 +2,15 @@
 #include "../libc_wrapper/libc_wrapper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <unistd.h>
 
 extern "C" void oh2_objc_msgSend(void);
 
@@ -25,6 +31,83 @@ static std::string nsstr_to_std(const void *obj) {
     if (!s || std::strcmp(s, "(null)") == 0 || std::strcmp(s, "<Object>") == 0) return "";
     return s;
 }
+
+/* Dynamically loaded Android ADPF (APerformanceHintManager, API 33+) + big-core affinity for RenderThread */
+struct AdpfHelper {
+    using GetMgrFn    = void *(*)(void);
+    using CreateSesFn = void *(*)(void *, const int32_t *, size_t, int64_t);
+    using ReportFn    = int (*)(void *, int64_t);
+
+    void       *session = nullptr;
+    ReportFn    report_fn = nullptr;
+    pid_t       boosted_tid = 0;
+
+    void boost_render_thread_once() {
+        pid_t tid = gettid();
+        if (__builtin_expect(boosted_tid == tid, 1)) return;
+        boosted_tid = tid;
+
+        /* 1. Detect big/prime cores (max_freq > min_max_freq) and pin RenderThread off LITTLE cores */
+        uint64_t freqs[16]{};
+        uint64_t min_f = UINT64_MAX, max_f = 0;
+        int ncpus = 0;
+        for (int c = 0; c < 16; ++c) {
+            char p[128];
+            std::snprintf(p, sizeof(p), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+            FILE *fp = std::fopen(p, "r");
+            if (!fp) break;
+            unsigned long long f = 0;
+            if (std::fscanf(fp, "%llu", &f) == 1 && f > 0) {
+                freqs[c] = (uint64_t)f;
+                if (freqs[c] < min_f) min_f = freqs[c];
+                if (freqs[c] > max_f) max_f = freqs[c];
+            }
+            std::fclose(fp);
+            ncpus = c + 1;
+        }
+        int big_cnt = 0;
+        if (ncpus > 1 && max_f > min_f) {
+            cpu_set_t mask;
+            CPU_ZERO(&mask);
+            for (int c = 0; c < ncpus; ++c) {
+                if (freqs[c] > min_f) {
+                    CPU_SET(c, &mask);
+                    big_cnt++;
+                }
+            }
+            if (big_cnt > 0) {
+                sched_setaffinity(0, sizeof(mask), &mask);
+            }
+        }
+        setpriority(PRIO_PROCESS, 0, -8);
+
+        /* 2. Register RenderThread with Android Performance Hint Manager (ADPF) targeting 16.6ms (60 FPS) */
+        void *lib = dlopen("libandroid.so", RTLD_LAZY | RTLD_LOCAL);
+        if (lib) {
+            auto get_mgr = reinterpret_cast<GetMgrFn>(dlsym(lib, "APerformanceHint_getManager"));
+            auto create_ses = reinterpret_cast<CreateSesFn>(dlsym(lib, "APerformanceHint_createSession"));
+            report_fn = reinterpret_cast<ReportFn>(dlsym(lib, "APerformanceHint_reportActualWorkDuration"));
+            if (get_mgr && create_ses && report_fn) {
+                void *mgr = get_mgr();
+                if (mgr) {
+                    int32_t tids[1] = {static_cast<int32_t>(tid)};
+                    session = create_ses(mgr, tids, 1, 16666667LL);
+                }
+            }
+        }
+        MTLVK_LOGI("[M5] RenderThread tid=%d boosted: big_cores=%d/%d (freq %llu..%llu kHz) adpf=%d",
+                   (int)tid, big_cnt, ncpus,
+                   (unsigned long long)min_f, (unsigned long long)max_f,
+                   session ? 1 : 0);
+    }
+
+    void report_work_ns(int64_t ns) {
+        if (session && report_fn && ns > 0) {
+            report_fn(session, ns);
+        }
+    }
+};
+static AdpfHelper g_adpf;
 } // namespace
 
 MtlVkState &get_state() {
@@ -312,6 +395,8 @@ void transition_image_layout(VkCommandBuffer cmd, VkImage image, VkImageAspectFl
 bool execute_immediate_upload(void (*record_fn)(VkCommandBuffer, void *), void *user_data) {
     MtlVkState &st = get_state();
     if (!st.initialized || !record_fn) return false;
+    auto t_iu0 = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> qlk(st.queue_mutex);
     VkDevice dev = st.vk_ctx.device();
 
     VkCommandBufferAllocateInfo alloc_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -340,6 +425,9 @@ bool execute_immediate_upload(void (*record_fn)(VkCommandBuffer, void *), void *
         st.staging.notify_fence_completed(st.upload_fence);
     }
     vkFreeCommandBuffers(dev, st.upload_pool, 1, &cmd);
+    auto iu_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_iu0).count();
+    st.prof_imm_up_us.fetch_add((uint64_t)iu_us, std::memory_order_relaxed);
+    st.prof_imm_up_cnt.fetch_add(1, std::memory_order_relaxed);
     return res == VK_SUCCESS;
 }
 
@@ -379,22 +467,114 @@ VkShaderModule get_or_create_shader_module(const SpirvShaderEntry *entry) {
     return mod;
 }
 
+static void completion_thread_fn(MtlVkState *st_ptr) {
+    MtlVkState &st = *st_ptr;
+    while (true) {
+        uint32_t fidx = 0;
+        PendingCbCompletion item;
+        {
+            std::unique_lock<std::mutex> clk(st.completion_mutex);
+            st.completion_cv.wait(clk, [&]() {
+                return st.completion_stop || !st.completion_queue.empty();
+            });
+            if (st.completion_stop && st.completion_queue.empty()) {
+                break;
+            }
+            fidx = st.completion_queue.front().first;
+            item = std::move(st.completion_queue.front().second);
+            st.completion_queue.pop_front();
+        }
+
+        FrameSyncSlot &slot = st.frames[fidx];
+        vkWaitForFences(st.vk_ctx.device(), 1, &slot.in_flight_fence, VK_TRUE, UINT64_MAX);
+        auto now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (item.submit_ns > 0 && now_ns > item.submit_ns) {
+            st.prof_gpu_fence_us.fetch_add((now_ns - item.submit_ns) / 1000ULL, std::memory_order_relaxed);
+        }
+        if (slot.ts_capturing && slot.ts_query_pool != VK_NULL_HANDLE && slot.ts_query_cursor >= 2) {
+            std::vector<uint64_t> ts_vals(slot.ts_query_cursor, 0);
+            VkResult tr = vkGetQueryPoolResults(
+                st.vk_ctx.device(), slot.ts_query_pool, 0, slot.ts_query_cursor,
+                ts_vals.size() * sizeof(uint64_t), ts_vals.data(), sizeof(uint64_t),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            if (tr == VK_SUCCESS) {
+                double cb_gpu_ms = (ts_vals[slot.ts_query_cursor - 1] >= ts_vals[0])
+                                       ? (double)(ts_vals[slot.ts_query_cursor - 1] - ts_vals[0]) * st.timestamp_period_ns / 1e6
+                                       : 0.0;
+                double wall_ms = (item.submit_ns > 0 && now_ns > item.submit_ns) ? (double)(now_ns - item.submit_ns) / 1e6 : 0.0;
+                double rec_ms = (item.begin_ns > 0 && item.submit_ns > item.begin_ns) ? (double)(item.submit_ns - item.begin_ns) / 1e6 : 0.0;
+                MTLVK_LOGI("[GPU_TS F#%llu] CB rec=%.2fms gpu=%.2fms wall=%.2fms passes=%zu (t_beg=%.1f t_sub=%.1f t_end=%.1f)",
+                           (unsigned long long)item.present_frame_tag, rec_ms, cb_gpu_ms, wall_ms,
+                           slot.ts_passes.size(),
+                           (double)(item.begin_ns % 100000000000ULL) / 1e6,
+                           (double)(item.submit_ns % 100000000000ULL) / 1e6,
+                           (double)(now_ns % 100000000000ULL) / 1e6);
+                for (size_t pi = 0; pi < slot.ts_passes.size(); ++pi) {
+                    const auto &pr = slot.ts_passes[pi];
+                    double pms = (pr.end_q < ts_vals.size() && pr.start_q < ts_vals.size() && ts_vals[pr.end_q] >= ts_vals[pr.start_q])
+                                     ? (double)(ts_vals[pr.end_q] - ts_vals[pr.start_q]) * st.timestamp_period_ns / 1e6
+                                     : 0.0;
+                    MTLVK_LOGI("[GPU_TS F#%llu]   P#%zu %ux%u(c=%u,df=%d) draws=%u fbsnap=%u occ=%u -> %.2fms",
+                               (unsigned long long)item.present_frame_tag, pi, pr.w, pr.h, pr.c_cnt, pr.dfmt,
+                               pr.draws, pr.fb_snaps, pr.occs, pms);
+                }
+            }
+            slot.ts_capturing = false;
+            slot.ts_passes.clear();
+        }
+        st.staging.notify_fence_completed(slot.in_flight_fence);
+
+        if (auto *cb = unwrap_mtl<MtlCommandBufferImpl>(item.cb_obj)) {
+            cb->status = 4; /* Completed */
+        }
+        for (void *blk : item.blocks) {
+            invoke_objc_block_1(blk, item.cb_obj);
+            release_objc_block(blk);
+        }
+        oh2_objc_release_object(item.cb_obj);
+
+        {
+            std::lock_guard<std::mutex> clk(st.completion_mutex);
+            slot.submitted = false;
+            st.slot_in_flight[fidx] = false;
+        }
+        st.completion_done_cv.notify_all();
+    }
+}
+
+static void wait_slot_idle(MtlVkState &st, uint32_t fidx) {
+    auto t0 = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> clk(st.completion_mutex);
+    st.completion_done_cv.wait(clk, [&]() { return !st.slot_in_flight[fidx]; });
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    st.prof_wait_slot_us.fetch_add((uint64_t)us, std::memory_order_relaxed);
+}
+
+static void wait_all_slots_idle(MtlVkState &st) {
+    std::unique_lock<std::mutex> clk(st.completion_mutex);
+    st.completion_done_cv.wait(clk, [&]() {
+        if (!st.completion_queue.empty()) return false;
+        for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+            if (st.slot_in_flight[i]) return false;
+        }
+        return true;
+    });
+}
+
 VkCommandBuffer mtl_begin_command_buffer_internal(MtlCommandBufferImpl *cb) {
     MtlVkState &st = get_state();
     if (!st.initialized || !cb) return VK_NULL_HANDLE;
     if (cb->recording && cb->cmd != VK_NULL_HANDLE) return cb->cmd;
 
     VkDevice dev = st.vk_ctx.device();
+    g_adpf.boost_render_thread_once();
     uint32_t fidx = st.next_frame_idx;
     st.next_frame_idx = (st.next_frame_idx + 1) % kMaxFramesInFlight;
     FrameSyncSlot &slot = st.frames[fidx];
 
-    if (slot.submitted) {
-        vkWaitForFences(dev, 1, &slot.in_flight_fence, VK_TRUE, UINT64_MAX);
-        st.staging.notify_fence_completed(slot.in_flight_fence);
-        slot.submitted = false;
-        tick_deferred_destroys(false);
-    }
+    wait_slot_idle(st, fidx);
+    tick_deferred_destroys(false);
     vkResetFences(dev, 1, &slot.in_flight_fence);
     vkResetCommandPool(dev, slot.cmd_pool, 0);
     vkResetDescriptorPool(dev, slot.desc_pool, 0);
@@ -402,14 +582,45 @@ VkCommandBuffer mtl_begin_command_buffer_internal(MtlCommandBufferImpl *cb) {
         if (p != VK_NULL_HANDLE) vkResetDescriptorPool(dev, p, 0);
     }
     slot.active_desc_pool_idx = 0;
+    slot.desc_cache_epoch++;
+    if (slot.desc_cache_epoch == 0) {
+        std::memset(slot.desc_cache, 0, sizeof(slot.desc_cache));
+        slot.desc_cache_epoch = 1;
+    }
     slot.inline_cursor = 0;
+    slot.staging_end_cursor = 0;
+    slot.occ_query_cursor = 0;
+    slot.ts_query_cursor = 0;
+    slot.ts_passes.clear();
+    slot.ts_capturing = false;
 
     VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(slot.cmd, &begin_info) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
+    if (slot.occ_query_pool != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(slot.cmd, slot.occ_query_pool, 0, kMaxOcclusionQueriesPerCB);
+    }
+    if (slot.ts_capturing) {
+        vkCmdResetQueryPool(slot.cmd, slot.ts_query_pool, 0, kMaxTimestampQueriesPerCB);
+        vkCmdWriteTimestamp(slot.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, slot.ts_query_pool, slot.ts_query_cursor++);
+    }
+    /* Synchronize GPU execution and caches across consecutive VkCommandBuffers on graphics_queue()
+       so prior command buffers' render passes, blits, and compute dispatches complete before this
+       command buffer reads or renders into shared attachments and buffers. */
+    VkMemoryBarrier init_mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    init_mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    init_mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(slot.cmd,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         0, 1, &init_mb, 0, nullptr, 0, nullptr);
+    static std::atomic<uint64_t> s_cmd_seq_gen{1};
     cb->frame_idx = fidx;
+    cb->cmd_seq_id = s_cmd_seq_gen.fetch_add(1, std::memory_order_relaxed);
+    cb->begin_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count();
     cb->cmd = slot.cmd;
     cb->recording = true;
     cb->committed = false;
@@ -437,7 +648,6 @@ bool mtl_alloc_inline_bytes(MtlCommandBufferImpl *cb, const void *data, uint64_t
     }
     if (data && len > 0) {
         std::memcpy(slot.inline_mapped + aligned_off, data, (size_t)len);
-        vmaFlushAllocation(st.vk_ctx.allocator(), slot.inline_alloc, aligned_off, len);
     }
     slot.inline_cursor = aligned_off + copy_len;
     *out_buf = slot.inline_buf;
@@ -452,20 +662,19 @@ bool mtl_acquire_swapchain_image_internal(MtlMetalLayerImpl *layer, uint32_t *ou
     VkDevice dev = st.vk_ctx.device();
     /* Drain oldest in-flight frame first so recycled acquire semaphore is guaranteed idle on GPU */
     uint32_t fidx = st.next_frame_idx;
-    if (st.frames[fidx].submitted) {
-        vkWaitForFences(dev, 1, &st.frames[fidx].in_flight_fence, VK_TRUE, UINT64_MAX);
-        st.staging.notify_fence_completed(st.frames[fidx].in_flight_fence);
-        st.frames[fidx].submitted = false;
-        tick_deferred_destroys(false);
-    }
+    wait_slot_idle(st, fidx);
+    tick_deferred_destroys(false);
 
     VkSemaphore acq_sem = st.acquire_sem_pool[st.next_acquire_sem];
     st.next_acquire_sem = (st.next_acquire_sem + 1) % 8;
 
     uint32_t sc_idx = 0;
+    auto t_acq0 = std::chrono::steady_clock::now();
     VkResult res = vkAcquireNextImageKHR(
         dev, st.vk_ctx.swapchain(), UINT64_MAX,
         acq_sem, VK_NULL_HANDLE, &sc_idx);
+    auto acq_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_acq0).count();
+    st.prof_acq_us.fetch_add((uint64_t)acq_us, std::memory_order_relaxed);
 
     if (res == VK_ERROR_OUT_OF_DATE_KHR) {
         st.swapchain_out_of_date = true;
@@ -474,9 +683,6 @@ bool mtl_acquire_swapchain_image_internal(MtlMetalLayerImpl *layer, uint32_t *ou
     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
         MTLVK_LOGE("vkAcquireNextImageKHR failed: %d", static_cast<int>(res));
         return false;
-    }
-    if (res == VK_SUBOPTIMAL_KHR) {
-        st.swapchain_out_of_date = true;
     }
     *out_sc_idx = sc_idx;
     *out_wait_sem = acq_sem;
@@ -490,19 +696,7 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
     if (!st.initialized || !cb) return false;
     if (cb->committed) {
         if (wait_completed && cb->status < 4) {
-            FrameSyncSlot &slot = st.frames[cb->frame_idx];
-            if (slot.submitted) {
-                vkWaitForFences(st.vk_ctx.device(), 1, &slot.in_flight_fence, VK_TRUE, UINT64_MAX);
-                st.staging.notify_fence_completed(slot.in_flight_fence);
-                slot.submitted = false;
-                tick_deferred_destroys(false);
-            }
-            cb->status = 4;
-            for (void *blk : cb->completed_blocks) {
-                invoke_objc_block_1(blk, cb_obj);
-                release_objc_block(blk);
-            }
-            cb->completed_blocks.clear();
+            wait_slot_idle(st, cb->frame_idx);
         }
         return true;
     }
@@ -517,22 +711,53 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
         if (tex && tex->is_swapchain) {
             VkImageLayout cur_layout = tex->mip_layouts.empty() ? VK_IMAGE_LAYOUT_UNDEFINED : tex->mip_layouts[0];
             if (cur_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
-                /* Transition swapchain image safely even if nothing drew directly into it */
                 transition_image_layout(cb->cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT,
                                         0, 1, 0, 1, cur_layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
                 cur_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             }
-            if (cur_layout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) {
+            if (st.use_virtual_drawable && cb->present_sc_idx < st.vk_ctx.swapchain_images().size()) {
+                VkImage sc_img = st.vk_ctx.swapchain_images()[cb->present_sc_idx];
+                VkExtent2D sc_ext = st.vk_ctx.swapchain_extent();
                 transition_image_layout(cb->cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT,
-                                        0, 1, 0, 1, cur_layout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-            }
-            if (!tex->mip_layouts.empty()) tex->mip_layouts[0] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            if (cb->present_sc_idx < st.swapchain_layouts.size()) {
-                st.swapchain_layouts[cb->present_sc_idx] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                                        0, 1, 0, 1, cur_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                transition_image_layout(cb->cmd, sc_img, VK_IMAGE_ASPECT_COLOR_BIT,
+                                        0, 1, 0, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                VkImageBlit blit{};
+                blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                blit.srcOffsets[0] = {0, 0, 0};
+                blit.srcOffsets[1] = {(int32_t)tex->width, (int32_t)tex->height, 1};
+                blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                blit.dstOffsets[0] = {0, 0, 0};
+                blit.dstOffsets[1] = {(int32_t)sc_ext.width, (int32_t)sc_ext.height, 1};
+                vkCmdBlitImage(cb->cmd,
+                               tex->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               sc_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               1, &blit, VK_FILTER_LINEAR);
+                transition_image_layout(cb->cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT,
+                                        0, 1, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                transition_image_layout(cb->cmd, sc_img, VK_IMAGE_ASPECT_COLOR_BIT,
+                                        0, 1, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+                if (!tex->mip_layouts.empty()) tex->mip_layouts[0] = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                if (cb->present_sc_idx < st.swapchain_layouts.size()) {
+                    st.swapchain_layouts[cb->present_sc_idx] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                }
+            } else {
+                if (cur_layout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) {
+                    transition_image_layout(cb->cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT,
+                                            0, 1, 0, 1, cur_layout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+                }
+                if (!tex->mip_layouts.empty()) tex->mip_layouts[0] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                if (cb->present_sc_idx < st.swapchain_layouts.size()) {
+                    st.swapchain_layouts[cb->present_sc_idx] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                }
             }
         }
     }
 
+    FrameSyncSlot &slot = st.frames[cb->frame_idx];
+    if (slot.ts_capturing && slot.ts_query_pool != VK_NULL_HANDLE && slot.ts_query_cursor < kMaxTimestampQueriesPerCB) {
+        vkCmdWriteTimestamp(cb->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, slot.ts_query_pool, slot.ts_query_cursor++);
+    }
     if (vkEndCommandBuffer(cb->cmd) != VK_SUCCESS) {
         MTLVK_LOGE("vkEndCommandBuffer failed");
         return false;
@@ -541,7 +766,9 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
     cb->committed = true;
     cb->status = 2; /* Committed */
 
-    FrameSyncSlot &slot = st.frames[cb->frame_idx];
+    if (slot.inline_cursor > 0 && slot.inline_alloc != VK_NULL_HANDLE) {
+        vmaFlushAllocation(st.vk_ctx.allocator(), slot.inline_alloc, 0, slot.inline_cursor);
+    }
     VkSemaphore wait_sems[1] = {cb->acquire_wait_sem};
     VkPipelineStageFlags wait_stages[1] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
     VkSemaphore signal_sems[1] = {};
@@ -562,12 +789,36 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
     submit.signalSemaphoreCount = signal_count;
     submit.pSignalSemaphores = signal_count ? signal_sems : nullptr;
 
-    VkResult qres = vkQueueSubmit(st.vk_ctx.graphics_queue(), 1, &submit, slot.in_flight_fence);
+    {
+        std::lock_guard<std::mutex> clk(st.completion_mutex);
+        st.slot_in_flight[cb->frame_idx] = true;
+        slot.submitted = true;
+    }
+
+    uint64_t submit_now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch()).count();
+    VkResult qres = VK_SUCCESS;
+    {
+        auto t_sub0 = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> qlk(st.queue_mutex);
+        qres = vkQueueSubmit(st.vk_ctx.graphics_queue(), 1, &submit, slot.in_flight_fence);
+        auto sub_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_sub0).count();
+        st.prof_sub_us.fetch_add((uint64_t)sub_us, std::memory_order_relaxed);
+    }
+    if (qres == VK_SUCCESS && slot.staging_end_cursor > 0) {
+        st.staging.track_submission(slot.staging_end_cursor, slot.in_flight_fence);
+        slot.staging_end_cursor = 0;
+    }
     if (qres != VK_SUCCESS) {
+        {
+            std::lock_guard<std::mutex> clk(st.completion_mutex);
+            st.slot_in_flight[cb->frame_idx] = false;
+            slot.submitted = false;
+        }
+        st.completion_done_cv.notify_all();
         MTLVK_LOGE("vkQueueSubmit failed: %d", static_cast<int>(qres));
         return false;
     }
-    slot.submitted = true;
     st.command_buffers_committed.fetch_add(1, std::memory_order_relaxed);
 
     {
@@ -580,6 +831,9 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
     }
 
     if (cb->present_requested && signal_count == 1) {
+        if (cb->begin_ns > 0 && submit_now_ns > cb->begin_ns) {
+            g_adpf.report_work_ns(static_cast<int64_t>(submit_now_ns - cb->begin_ns));
+        }
         VkSwapchainKHR sc = st.vk_ctx.swapchain();
         VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         present.waitSemaphoreCount = 1;
@@ -587,13 +841,17 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
         present.swapchainCount = 1;
         present.pSwapchains = &sc;
         present.pImageIndices = &cb->present_sc_idx;
-        VkResult pres = vkQueuePresentKHR(st.vk_ctx.graphics_queue(), &present);
+        VkResult pres = VK_SUCCESS;
+        {
+            auto t_pr0 = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> qlk(st.queue_mutex);
+            pres = vkQueuePresentKHR(st.vk_ctx.graphics_queue(), &present);
+            auto pr_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_pr0).count();
+            st.prof_pres_us.fetch_add((uint64_t)pr_us, std::memory_order_relaxed);
+        }
         if (pres == VK_ERROR_OUT_OF_DATE_KHR) {
             st.swapchain_out_of_date = true;
         } else if (pres == VK_SUBOPTIMAL_KHR || pres == VK_SUCCESS) {
-            if (pres == VK_SUBOPTIMAL_KHR) {
-                st.swapchain_out_of_date = true;
-            }
             const uint64_t pcount = st.presents.fetch_add(1, std::memory_order_relaxed) + 1;
             if (pcount == 1 || (pcount % 60) == 0) {
                 MTLVK_LOGI("[M5] Present frame #%llu (%ux%u, rc=%d)",
@@ -612,6 +870,39 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
                            static_cast<unsigned long long>(st.mtlb_cache_misses.load(std::memory_order_relaxed)),
                            static_cast<unsigned long long>(st.blended_pipelines_created.load(std::memory_order_relaxed)),
                            static_cast<unsigned long long>(st.graphics_pipelines_created.load(std::memory_order_relaxed)));
+                static auto s_prev_tp = std::chrono::steady_clock::now();
+                static uint64_t s_prev_draws = 0, s_prev_idraws = 0, s_prev_fb = 0, s_prev_occ = 0, s_prev_bt = 0, s_prev_rp = 0, s_prev_wait = 0, s_prev_flush = 0, s_prev_acq = 0, s_prev_sub = 0, s_prev_pres = 0, s_prev_iu_us = 0, s_prev_iu_cnt = 0, s_prev_dh = 0, s_prev_dm = 0;
+                auto now_tp = std::chrono::steady_clock::now();
+                double dt_ms = std::chrono::duration<double, std::milli>(now_tp - s_prev_tp).count();
+                s_prev_tp = now_tp;
+                uint64_t d_dr = st.draw_calls.load(std::memory_order_relaxed) - s_prev_draws;
+                uint64_t d_id = st.indexed_draw_calls.load(std::memory_order_relaxed) - s_prev_idraws;
+                uint64_t d_fb = st.prof_fb_snaps.load(std::memory_order_relaxed) - s_prev_fb;
+                uint64_t d_oc = st.prof_occ_queries.load(std::memory_order_relaxed) - s_prev_occ;
+                uint64_t d_bt = st.prof_buftex_uploads.load(std::memory_order_relaxed) - s_prev_bt;
+                uint64_t d_rp = st.prof_render_passes.load(std::memory_order_relaxed) - s_prev_rp;
+                uint64_t d_wt = st.prof_wait_slot_us.load(std::memory_order_relaxed) - s_prev_wait;
+                uint64_t d_fl = st.prof_flush_us.load(std::memory_order_relaxed) - s_prev_flush;
+                uint64_t d_aq = st.prof_acq_us.load(std::memory_order_relaxed) - s_prev_acq;
+                uint64_t d_sb = st.prof_sub_us.load(std::memory_order_relaxed) - s_prev_sub;
+                uint64_t d_pr = st.prof_pres_us.load(std::memory_order_relaxed) - s_prev_pres;
+                uint64_t d_iu = st.prof_imm_up_us.load(std::memory_order_relaxed) - s_prev_iu_us;
+                uint64_t d_ic = st.prof_imm_up_cnt.load(std::memory_order_relaxed) - s_prev_iu_cnt;
+                uint64_t d_dh = st.prof_desc_hits.load(std::memory_order_relaxed) - s_prev_dh;
+                uint64_t d_dm = st.prof_desc_misses.load(std::memory_order_relaxed) - s_prev_dm;
+                s_prev_draws += d_dr; s_prev_idraws += d_id; s_prev_fb += d_fb; s_prev_occ += d_oc;
+                s_prev_bt += d_bt; s_prev_rp += d_rp; s_prev_wait += d_wt; s_prev_flush += d_fl;
+                s_prev_acq += d_aq; s_prev_sub += d_sb; s_prev_pres += d_pr;
+                s_prev_iu_us += d_iu; s_prev_iu_cnt += d_ic;
+                s_prev_dh += d_dh; s_prev_dm += d_dm;
+                if (pcount >= 60 && dt_ms > 1.0) {
+                    MTLVK_LOGI("[M5] Prof60: fps=%.1f frame=%.1fms draws/f=%.1f rp/f=%.1f fb_snap/f=%.1f occ/f=%.1f btex/f=%.1f dcache=%.0f/%.0f imm=%.1f(%.1fms) acq/f=%.1fms",
+                               60000.0 / dt_ms, dt_ms / 60.0, (double)(d_dr + d_id) / 60.0,
+                               (double)d_rp / 60.0, (double)d_fb / 60.0, (double)d_oc / 60.0,
+                               (double)d_bt / 60.0, (double)d_dh / 60.0, (double)(d_dh + d_dm) / 60.0,
+                               (double)d_ic / 60.0, (double)d_iu / 60000.0,
+                               (double)d_aq / 60000.0);
+                }
             }
         } else {
             MTLVK_LOGE("vkQueuePresentKHR failed: %d", static_cast<int>(pres));
@@ -622,18 +913,22 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
         }
     }
 
-    if (wait_completed || !cb->completed_blocks.empty()) {
-        vkWaitForFences(st.vk_ctx.device(), 1, &slot.in_flight_fence, VK_TRUE, UINT64_MAX);
-        st.staging.notify_fence_completed(slot.in_flight_fence);
-        slot.submitted = false;
+    {
+        std::lock_guard<std::mutex> clk(st.completion_mutex);
+        PendingCbCompletion pcc{};
+        pcc.cb_obj = cb_obj;
+        pcc.begin_ns = cb->begin_ns;
+        pcc.submit_ns = submit_now_ns;
+        pcc.present_frame_tag = st.presents.load(std::memory_order_relaxed);
+        oh2_objc_add_refcount(cb_obj, 1);
+        pcc.blocks.swap(cb->completed_blocks);
+        st.completion_queue.emplace_back(cb->frame_idx, std::move(pcc));
+    }
+    st.completion_cv.notify_one();
+
+    if (wait_completed) {
+        wait_slot_idle(st, cb->frame_idx);
         tick_deferred_destroys(false);
-        cb->status = 4; /* Completed */
-        std::vector<void *> comp;
-        comp.swap(cb->completed_blocks);
-        for (void *blk : comp) {
-            invoke_objc_block_1(blk, cb_obj);
-            release_objc_block(blk);
-        }
     }
     return true;
 }
@@ -646,6 +941,17 @@ bool create_per_swapchain_sync(MtlVkState &st) {
         if (s != VK_NULL_HANDLE) vkDestroySemaphore(dev, s, nullptr);
     }
     st.render_finished_sems.clear();
+    for (VkImageView v : st.virtual_drawable_views) {
+        if (v != VK_NULL_HANDLE) vkDestroyImageView(dev, v, nullptr);
+    }
+    for (size_t i = 0; i < st.virtual_drawable_images.size(); ++i) {
+        if (st.virtual_drawable_images[i] != VK_NULL_HANDLE) {
+            vmaDestroyImage(st.vk_ctx.allocator(), st.virtual_drawable_images[i], st.virtual_drawable_allocs[i]);
+        }
+    }
+    st.virtual_drawable_views.clear();
+    st.virtual_drawable_images.clear();
+    st.virtual_drawable_allocs.clear();
     st.swapchain_layouts.clear();
 
     const auto &imgs = st.vk_ctx.swapchain_images();
@@ -656,6 +962,18 @@ bool create_per_swapchain_sync(MtlVkState &st) {
                              (sc_fmt == VK_FORMAT_B8G8R8A8_SRGB) ? 81 :
                              (sc_fmt == VK_FORMAT_R8G8B8A8_SRGB) ? 71 : 70;
 
+    /* Scale high-DPI mobile screens (>720p height) to crisp iPhone-class 720p virtual drawable
+       with exact aspect ratio, then hardware-blit linearly to physical swapchain for 2.25x GPU speedup. */
+    uint32_t virt_w = ext.width;
+    uint32_t virt_h = ext.height;
+    if (ext.height > 720u && ext.width > ext.height) {
+        virt_h = 720u;
+        virt_w = ((ext.width * virt_h) / ext.height + 3u) & ~3u;
+    }
+    st.virtual_render_w = virt_w;
+    st.virtual_render_h = virt_h;
+    st.use_virtual_drawable = (virt_w != ext.width || virt_h != ext.height);
+
     const size_t n = imgs.size();
     st.render_finished_sems.resize(n, VK_NULL_HANDLE);
     st.swapchain_layouts.resize(n, VK_IMAGE_LAYOUT_UNDEFINED);
@@ -664,6 +982,46 @@ bool create_per_swapchain_sync(MtlVkState &st) {
         if (vkCreateSemaphore(dev, &si, nullptr, &st.render_finished_sems[i]) != VK_SUCCESS) {
             MTLVK_LOGE("Failed creating render_finished_sems[%zu]", i);
             return false;
+        }
+    }
+
+    if (st.use_virtual_drawable) {
+        st.virtual_drawable_images.resize(n, VK_NULL_HANDLE);
+        st.virtual_drawable_allocs.resize(n, VK_NULL_HANDLE);
+        st.virtual_drawable_views.resize(n, VK_NULL_HANDLE);
+        for (size_t i = 0; i < n; ++i) {
+            VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ici.imageType = VK_IMAGE_TYPE_2D;
+            ici.format = sc_fmt;
+            ici.extent = {virt_w, virt_h, 1};
+            ici.mipLevels = 1;
+            ici.arrayLayers = 1;
+            ici.samples = VK_SAMPLE_COUNT_1_BIT;
+            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VmaAllocationCreateInfo vai{};
+            vai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+            if (vmaCreateImage(st.vk_ctx.allocator(), &ici, &vai,
+                               &st.virtual_drawable_images[i], &st.virtual_drawable_allocs[i], nullptr) != VK_SUCCESS) {
+                st.use_virtual_drawable = false;
+                st.virtual_render_w = ext.width;
+                st.virtual_render_h = ext.height;
+                break;
+            }
+            VkImageViewCreateInfo ivci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            ivci.image = st.virtual_drawable_images[i];
+            ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            ivci.format = sc_fmt;
+            ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            if (vkCreateImageView(dev, &ivci, nullptr, &st.virtual_drawable_views[i]) != VK_SUCCESS) {
+                st.use_virtual_drawable = false;
+                st.virtual_render_w = ext.width;
+                st.virtual_render_h = ext.height;
+                break;
+            }
         }
     }
 
@@ -678,13 +1036,13 @@ bool create_per_swapchain_sync(MtlVkState &st) {
         } else {
             tex = unwrap_mtl<MtlTextureImpl>(st.swapchain_tex_objs[i]);
         }
-        tex->image = imgs[i];
-        tex->view = (i < views.size()) ? views[i] : VK_NULL_HANDLE;
+        tex->image = st.use_virtual_drawable ? st.virtual_drawable_images[i] : imgs[i];
+        tex->view = st.use_virtual_drawable ? st.virtual_drawable_views[i] : ((i < views.size()) ? views[i] : VK_NULL_HANDLE);
         tex->vk_format = sc_fmt;
         tex->mtl_pixel_format = mtl_fmt;
         tex->texture_type = kMTLTextureType2D;
-        tex->width = ext.width;
-        tex->height = ext.height;
+        tex->width = st.virtual_render_w;
+        tex->height = st.virtual_render_h;
         tex->depth = 1;
         tex->mip_levels = 1;
         tex->array_layers = 1;
@@ -1553,6 +1911,10 @@ int mtl_vk_init(ANativeWindow *window, const char *spirv_cache_path, int enable_
     VkFenceCreateInfo uf_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (vkCreateFence(dev, &uf_info, nullptr, &st.upload_fence) != VK_SUCCESS) return -1;
 
+    VkPhysicalDeviceProperties pdp{};
+    vkGetPhysicalDeviceProperties(st.vk_ctx.physical_device(), &pdp);
+    st.timestamp_period_ns = (pdp.limits.timestampPeriod > 0.0f) ? pdp.limits.timestampPeriod : 1.0f;
+
     for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
         FrameSyncSlot &f = st.frames[i];
         VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -1571,6 +1933,23 @@ int mtl_vk_init(ANativeWindow *window, const char *spirv_cache_path, int enable_
         f.overflow_desc_pools.clear();
         f.active_desc_pool_idx = 0;
 
+        VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpci.queryType = VK_QUERY_TYPE_OCCLUSION;
+        qpci.queryCount = kMaxOcclusionQueriesPerCB;
+        if (vkCreateQueryPool(dev, &qpci, nullptr, &f.occ_query_pool) != VK_SUCCESS) {
+            f.occ_query_pool = VK_NULL_HANDLE;
+        }
+        f.occ_query_cursor = 0;
+
+        VkQueryPoolCreateInfo tqpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        tqpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        tqpci.queryCount = kMaxTimestampQueriesPerCB;
+        if (vkCreateQueryPool(dev, &tqpci, nullptr, &f.ts_query_pool) != VK_SUCCESS) {
+            f.ts_query_pool = VK_NULL_HANDLE;
+        }
+        f.ts_query_cursor = 0;
+        f.ts_capturing = false;
+
         VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         if (vkCreateSemaphore(dev, &si, nullptr, &f.image_available_sem) != VK_SUCCESS) return -1;
 
@@ -1579,11 +1958,12 @@ int mtl_vk_init(ANativeWindow *window, const char *spirv_cache_path, int enable_
         if (vkCreateFence(dev, &fi, nullptr, &f.in_flight_fence) != VK_SUCCESS) return -1;
         f.submitted = false;
 
-        f.inline_capacity = 16ULL * 1024ULL * 1024ULL;
+        f.inline_capacity = 32ULL * 1024ULL * 1024ULL;
         VkBufferCreateInfo ibci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         ibci.size = f.inline_capacity;
         ibci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         ibci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         VmaAllocationCreateInfo ivai{};
         ivai.usage = VMA_MEMORY_USAGE_AUTO;
@@ -1608,6 +1988,15 @@ int mtl_vk_init(ANativeWindow *window, const char *spirv_cache_path, int enable_
         return -1;
     }
 
+    {
+        std::lock_guard<std::mutex> clk(st.completion_mutex);
+        st.completion_stop = false;
+        for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) st.slot_in_flight[i] = false;
+        st.completion_queue.clear();
+        st.completion_thread = std::thread(completion_thread_fn, &st);
+        st.completion_thread_started = true;
+    }
+
     if (spirv_cache_path && spirv_cache_path[0]) {
         bool cache_ok = spirv_cache_load(spirv_cache_path);
         MTLVK_LOGI("SPIR-V cache load('%s'): ok=%d entries=%u",
@@ -1615,9 +2004,11 @@ int mtl_vk_init(ANativeWindow *window, const char *spirv_cache_path, int enable_
     }
 
     VkExtent2D ext = st.vk_ctx.swapchain_extent();
-    oh2_ui_set_screen_dimensions(ext.width, ext.height, 2.0);
-    MTLVK_LOGI("[M5] mtl_vk_init ready: GPU=%s swapchain=%ux%u dyn_render=%d astc=(%d,%d,%d) val=%d",
+    oh2_ui_set_physical_dimensions(ext.width, ext.height);
+    oh2_ui_set_screen_dimensions(st.virtual_render_w, st.virtual_render_h, 2.0);
+    MTLVK_LOGI("[M5] mtl_vk_init ready: GPU=%s swapchain=%ux%u render=%ux%u dyn_render=%d astc=(%d,%d,%d) val=%d",
                st.vk_ctx.caps().device_name, ext.width, ext.height,
+               st.virtual_render_w, st.virtual_render_h,
                st.vk_ctx.caps().dynamic_rendering ? 1 : 0,
                st.vk_ctx.caps().astc_4x4 ? 1 : 0,
                st.vk_ctx.caps().astc_6x6 ? 1 : 0,
@@ -1631,13 +2022,10 @@ int mtl_vk_set_surface(ANativeWindow *window) {
     MtlVkState &st = get_state();
     if (!st.initialized || !window) return -1;
     VkDevice dev = st.vk_ctx.device();
-    vkDeviceWaitIdle(dev);
-    for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
-        if (st.frames[i].submitted) {
-            vkWaitForFences(dev, 1, &st.frames[i].in_flight_fence, VK_TRUE, UINT64_MAX);
-            st.staging.notify_fence_completed(st.frames[i].in_flight_fence);
-            st.frames[i].submitted = false;
-        }
+    wait_all_slots_idle(st);
+    {
+        std::lock_guard<std::mutex> qlk(st.queue_mutex);
+        vkDeviceWaitIdle(dev);
     }
     tick_deferred_destroys(true);
     if (!st.vk_ctx.rebind_surface(window)) {
@@ -1648,12 +2036,13 @@ int mtl_vk_set_surface(ANativeWindow *window) {
     st.swapchain_out_of_date = false;
     st.surface_recreates.fetch_add(1, std::memory_order_relaxed);
     VkExtent2D ext = st.vk_ctx.swapchain_extent();
-    oh2_ui_set_screen_dimensions(ext.width, ext.height, 2.0);
+    oh2_ui_set_physical_dimensions(ext.width, ext.height);
+    oh2_ui_set_screen_dimensions(st.virtual_render_w, st.virtual_render_h, 2.0);
     if (st.shared_layer_obj) {
         auto *l = unwrap_mtl<MtlMetalLayerImpl>(st.shared_layer_obj);
         if (l) {
-            l->drawable_width = (double)ext.width;
-            l->drawable_height = (double)ext.height;
+            l->drawable_width = (double)st.virtual_render_w;
+            l->drawable_height = (double)st.virtual_render_h;
             l->has_active_drawable = false;
         }
     }
@@ -1666,8 +2055,23 @@ void mtl_vk_shutdown(void) {
     using namespace oh2::mtlvk;
     MtlVkState &st = get_state();
     if (!st.initialized) return;
+    wait_all_slots_idle(st);
+    if (st.completion_thread_started) {
+        {
+            std::lock_guard<std::mutex> clk(st.completion_mutex);
+            st.completion_stop = true;
+        }
+        st.completion_cv.notify_all();
+        if (st.completion_thread.joinable()) {
+            st.completion_thread.join();
+        }
+        st.completion_thread_started = false;
+    }
     VkDevice dev = st.vk_ctx.device();
-    vkDeviceWaitIdle(dev);
+    {
+        std::lock_guard<std::mutex> qlk(st.queue_mutex);
+        vkDeviceWaitIdle(dev);
+    }
     tick_deferred_destroys(true);
 
     for (auto &kv : st.shader_modules) {
@@ -1703,6 +2107,17 @@ void mtl_vk_shutdown(void) {
         if (s != VK_NULL_HANDLE) vkDestroySemaphore(dev, s, nullptr);
     }
     st.render_finished_sems.clear();
+    for (VkImageView v : st.virtual_drawable_views) {
+        if (v != VK_NULL_HANDLE) vkDestroyImageView(dev, v, nullptr);
+    }
+    for (size_t i = 0; i < st.virtual_drawable_images.size(); ++i) {
+        if (st.virtual_drawable_images[i] != VK_NULL_HANDLE) {
+            vmaDestroyImage(st.vk_ctx.allocator(), st.virtual_drawable_images[i], st.virtual_drawable_allocs[i]);
+        }
+    }
+    st.virtual_drawable_views.clear();
+    st.virtual_drawable_images.clear();
+    st.virtual_drawable_allocs.clear();
 
     for (uint32_t i = 0; i < 8; ++i) {
         if (st.acquire_sem_pool[i] != VK_NULL_HANDLE) {
@@ -1712,6 +2127,14 @@ void mtl_vk_shutdown(void) {
     }
 
     for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+        if (st.frames[i].occ_query_pool != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(dev, st.frames[i].occ_query_pool, nullptr);
+            st.frames[i].occ_query_pool = VK_NULL_HANDLE;
+        }
+        if (st.frames[i].ts_query_pool != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(dev, st.frames[i].ts_query_pool, nullptr);
+            st.frames[i].ts_query_pool = VK_NULL_HANDLE;
+        }
         if (st.frames[i].inline_buf != VK_NULL_HANDLE) {
             vmaDestroyBuffer(st.vk_ctx.allocator(), st.frames[i].inline_buf, st.frames[i].inline_alloc);
             st.frames[i].inline_buf = VK_NULL_HANDLE;

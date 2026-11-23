@@ -11,10 +11,13 @@
 
 #include <android/log.h>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -127,6 +130,8 @@ constexpr uint64_t kMaxColorAttachments = 8;
 /* ============================================================================
  * C++ Backing Structures (each ObjC object starts with `void *isa; Impl *impl;`)
  * ============================================================================ */
+struct MtlTextureImpl;
+
 struct MtlBufferImpl {
     VkBuffer      buffer = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
@@ -134,6 +139,9 @@ struct MtlBufferImpl {
     uint64_t      options = 0;
     void         *mapped = nullptr;
     bool          host_coherent = false;
+    std::atomic<uint64_t> mod_gen{1};
+    std::atomic<bool> needs_host_invalidate{false};
+    std::vector<MtlTextureImpl *> buffer_views;
     std::string   label;
 };
 
@@ -178,6 +186,9 @@ struct MtlTextureImpl {
     bool            retains_parent_buf = false;
     uint64_t        buffer_offset = 0;
     uint64_t        buffer_bytes_per_row = 0;
+    uint64_t        synced_buf_gen = 0;
+    uint64_t        synced_content_hash = 0;
+    uint64_t        synced_cmd_seq = 0;
     uint64_t        cpu_cache_mode = 0;
     uint64_t        storage_mode = 2;
     uint64_t        usage = 1;
@@ -320,6 +331,12 @@ struct MtlRenderPipelineStateImpl {
     VkDescriptorSetLayout set1_layout = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     uint32_t vertex_buffer_mask = 0;
+    uint32_t vs_used_buf_mask = 0;
+    uint32_t vs_used_tex_mask = 0;
+    uint32_t vs_used_smp_mask = 0;
+    uint32_t ps_used_buf_mask = 0;
+    uint32_t ps_used_tex_mask = 0;
+    uint32_t ps_used_smp_mask = 0;
     MtlVertexDescriptorImpl vtx_desc_copy{};
     std::unordered_map<uint64_t, VkPipeline> specialized_pipelines;
 };
@@ -375,6 +392,7 @@ struct MtlRenderPassDescImpl {
     void                      *color_wraps[kMaxColorAttachments]{};
     void                      *depth_wrap = nullptr;
     void                      *stencil_wrap = nullptr;
+    void                      *visibility_result_buffer_obj = nullptr;
     uint32_t                   rt_width = 0;
     uint32_t                   rt_height = 0;
 };
@@ -396,6 +414,8 @@ struct MtlStageBindings {
     uint64_t buffer_offset[kMaxBuffers]{};
     uint64_t buffer_range[kMaxBuffers]{};
     uint64_t buffer_total_len[kMaxBuffers]{};
+    uint8_t *buffer_mapped[kMaxBuffers]{};
+    void    *buffer_obj[kMaxBuffers]{};
     bool     buffer_bound[kMaxBuffers]{};
 
     VkImageView tex_view[kMaxTextures]{};
@@ -405,10 +425,17 @@ struct MtlStageBindings {
 
     VkSampler sampler[kMaxSamplers]{};
     bool      sampler_bound[kMaxSamplers]{};
+    bool      desc_dirty = true;
+    uint32_t  dirty_buf_mask = 0xFFFFFFFFu;
+    uint32_t  dirty_tex_mask = 0xFFFFFFFFu;
+    uint32_t  dirty_smp_mask = 0xFFFFFFFFu;
+    uint32_t  vb_dirty_mask = 0xFFFFFFFFu;
 };
 
 struct MtlCommandBufferImpl {
     uint32_t frame_idx = 0;
+    uint64_t cmd_seq_id = 0;
+    uint64_t begin_ns = 0;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     bool recording = false;
     bool committed = false;
@@ -455,6 +482,34 @@ struct MtlRenderEncoderImpl {
 
     MtlStageBindings vs{};
     MtlStageBindings ps{};
+    VkPipeline bound_pipeline = VK_NULL_HANDLE;
+    void *bound_pso_obj = nullptr;
+    void *bound_dss_obj = nullptr;
+    uint64_t bound_ptype = UINT64_MAX;
+    uint64_t bound_cull = UINT64_MAX;
+    uint64_t bound_wind = UINT64_MAX;
+    uint64_t bound_fill = UINT64_MAX;
+    VkDescriptorSet bound_set0 = VK_NULL_HANDLE;
+    VkDescriptorSetLayout bound_set0_layout = VK_NULL_HANDLE;
+    VkDescriptorSet bound_set1 = VK_NULL_HANDLE;
+    VkDescriptorSetLayout bound_set1_layout = VK_NULL_HANDLE;
+    VkPipelineLayout bound_pipe_layout = VK_NULL_HANDLE;
+    bool viewport_dirty = true;
+    bool scissor_dirty = true;
+    bool depth_bias_dirty = true;
+    bool blend_constants_dirty = true;
+    bool stencil_ref_dirty = true;
+    uint64_t vis_mode = 0;
+    uint64_t vis_offset = 0;
+    bool occ_query_active = false;
+    uint32_t occ_active_qidx = 0;
+    bool fb_fetch_snap_valid = false;
+    void *fb_fetch_last_pso = nullptr;
+    uint32_t ts_pass_idx = UINT32_MAX;
+    uint32_t pass_draws = 0;
+    uint32_t pass_fb_snaps = 0;
+    std::vector<std::pair<uint32_t, uint64_t>> occ_queries;
+    std::vector<std::pair<uint64_t, uint64_t>> vis_writes;
     bool inside_render_pass = false;
 };
 
@@ -480,22 +535,63 @@ struct MtlObjWrap {
 /* ============================================================================
  * Singleton Context State
  * ============================================================================ */
-static constexpr uint32_t kMaxFramesInFlight = 2;
+static constexpr uint32_t kMaxFramesInFlight = 8;
+static constexpr uint32_t kMaxOcclusionQueriesPerCB = 2048;
+static constexpr uint32_t kMaxTimestampQueriesPerCB = 128;
+static constexpr uint32_t kDescCacheSize = 1024;
+
+struct DescCacheEntry {
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSet       set = VK_NULL_HANDLE;
+    uint64_t              h1 = 0;
+    uint64_t              h2 = 0;
+    uint32_t              epoch = 0;
+};
+
+struct TsPassRecord {
+    uint32_t start_q = 0;
+    uint32_t end_q = 0;
+    uint32_t w = 0;
+    uint32_t h = 0;
+    uint32_t c_cnt = 0;
+    int      dfmt = 0;
+    uint32_t draws = 0;
+    uint32_t fb_snaps = 0;
+    uint32_t occs = 0;
+};
+
+struct PendingCbCompletion {
+    void               *cb_obj = nullptr;
+    std::vector<void *> blocks;
+    uint64_t            begin_ns = 0;
+    uint64_t            submit_ns = 0;
+    uint64_t            present_frame_tag = 0;
+};
 
 struct FrameSyncSlot {
-    VkCommandPool                 cmd_pool = VK_NULL_HANDLE;
-    VkCommandBuffer               cmd = VK_NULL_HANDLE;
-    VkDescriptorPool              desc_pool = VK_NULL_HANDLE;
-    std::vector<VkDescriptorPool> overflow_desc_pools;
-    uint32_t                      active_desc_pool_idx = 0;
-    VkSemaphore                   image_available_sem = VK_NULL_HANDLE;
-    VkFence                       in_flight_fence = VK_NULL_HANDLE;
-    VkBuffer                      inline_buf = VK_NULL_HANDLE;
-    VmaAllocation                 inline_alloc = VK_NULL_HANDLE;
-    uint8_t                      *inline_mapped = nullptr;
-    uint64_t                      inline_cursor = 0;
-    uint64_t                      inline_capacity = 0;
-    bool                          submitted = false;
+    VkCommandPool                    cmd_pool = VK_NULL_HANDLE;
+    VkCommandBuffer                  cmd = VK_NULL_HANDLE;
+    VkDescriptorPool                 desc_pool = VK_NULL_HANDLE;
+    std::vector<VkDescriptorPool>    overflow_desc_pools;
+    uint32_t                         active_desc_pool_idx = 0;
+    DescCacheEntry                   desc_cache[kDescCacheSize]{};
+    uint32_t                         desc_cache_epoch = 1;
+    VkQueryPool                      occ_query_pool = VK_NULL_HANDLE;
+    uint32_t                         occ_query_cursor = 0;
+    VkQueryPool                      ts_query_pool = VK_NULL_HANDLE;
+    uint32_t                         ts_query_cursor = 0;
+    bool                             ts_capturing = false;
+    std::vector<TsPassRecord>        ts_passes;
+    VkSemaphore                      image_available_sem = VK_NULL_HANDLE;
+    VkFence                          in_flight_fence = VK_NULL_HANDLE;
+    VkBuffer                         inline_buf = VK_NULL_HANDLE;
+    VmaAllocation                    inline_alloc = VK_NULL_HANDLE;
+    uint8_t                         *inline_mapped = nullptr;
+    uint64_t                         inline_cursor = 0;
+    uint64_t                         inline_capacity = 0;
+    uint64_t                         staging_end_cursor = 0;
+    bool                             submitted = false;
+    std::vector<PendingCbCompletion> pending_completions;
 };
 
 struct DeferredDestroy {
@@ -516,8 +612,17 @@ struct DeferredDestroy {
     uint32_t      frames_remaining = 3;
 };
 
+struct PendingTexUpload {
+    void                *tex_obj = nullptr;
+    uint32_t             level = 0;
+    uint32_t             slice = 0;
+    MTLRegion            reg{};
+    std::vector<uint8_t> bytes;
+};
+
 struct MtlVkState {
     std::mutex                   mutex;
+    std::mutex                   queue_mutex;
     bool                         initialized = false;
     bool                         validation_enabled = false;
     oh2::vk::VkContext           vk_ctx;
@@ -528,12 +633,26 @@ struct MtlVkState {
     VkFence                      upload_fence = VK_NULL_HANDLE;
 
     FrameSyncSlot                frames[kMaxFramesInFlight]{};
+    std::mutex                   completion_mutex;
+    std::condition_variable      completion_cv;
+    std::condition_variable      completion_done_cv;
+    std::deque<std::pair<uint32_t, PendingCbCompletion>> completion_queue;
+    bool                         slot_in_flight[kMaxFramesInFlight]{};
+    bool                         completion_stop = false;
+    bool                         completion_thread_started = false;
+    std::thread                  completion_thread;
     VkSemaphore                  acquire_sem_pool[8]{};
     uint32_t                     next_acquire_sem = 0;
     std::vector<VkSemaphore>     render_finished_sems;
     std::vector<VkImageLayout>   swapchain_layouts;
     std::vector<void *>          swapchain_tex_objs;
     std::vector<void *>          swapchain_drawable_objs;
+    std::vector<VkImage>         virtual_drawable_images;
+    std::vector<VmaAllocation>   virtual_drawable_allocs;
+    std::vector<VkImageView>     virtual_drawable_views;
+    uint32_t                     virtual_render_w = 0;
+    uint32_t                     virtual_render_h = 0;
+    bool                         use_virtual_drawable = false;
     std::vector<DeferredDestroy> deferred_destroys;
     uint32_t                     next_frame_idx = 0;
     bool                         swapchain_out_of_date = false;
@@ -553,6 +672,16 @@ struct MtlVkState {
     std::unordered_map<uint64_t, VkShaderModule> shader_modules;
     std::unordered_map<uint64_t, VkRenderPass>   render_pass_cache;
     std::unordered_map<std::string, uint64_t>    compat_render_pass_cache;
+
+    /* Active buffer-backed textures for pipelined dirty sync before render passes */
+    std::mutex                    buf_tex_mutex;
+    std::vector<MtlTextureImpl *> active_buf_textures;
+    std::atomic<bool>             any_buf_tex_dirty{false};
+
+    /* Async deferred replaceRegion uploads flushed onto the next VkCommandBuffer */
+    std::mutex                    pending_tex_mutex;
+    std::vector<PendingTexUpload> pending_tex_uploads;
+    std::atomic<bool>             has_pending_tex_uploads{false};
 
     /* Singleton ObjC objects */
     void *device_obj = nullptr;
@@ -581,6 +710,21 @@ struct MtlVkState {
     std::atomic<int64_t>  live_encoders{0};
     std::atomic<uint64_t> mtlb_cache_hits{0};
     std::atomic<uint64_t> mtlb_cache_misses{0};
+    std::atomic<uint64_t> prof_fb_snaps{0};
+    std::atomic<uint64_t> prof_occ_queries{0};
+    std::atomic<uint64_t> prof_buftex_uploads{0};
+    std::atomic<uint64_t> prof_render_passes{0};
+    std::atomic<uint64_t> prof_wait_slot_us{0};
+    std::atomic<uint64_t> prof_flush_us{0};
+    std::atomic<uint64_t> prof_acq_us{0};
+    std::atomic<uint64_t> prof_sub_us{0};
+    std::atomic<uint64_t> prof_pres_us{0};
+    std::atomic<uint64_t> prof_gpu_fence_us{0};
+    std::atomic<uint64_t> prof_imm_up_us{0};
+    std::atomic<uint64_t> prof_imm_up_cnt{0};
+    std::atomic<uint64_t> prof_desc_hits{0};
+    std::atomic<uint64_t> prof_desc_misses{0};
+    float                 timestamp_period_ns = 1.0f;
 
     /* Cached snapshot image for Metal programmable blending / framebuffer fetch (color(0)) */
     VkImage       fb_fetch_image = VK_NULL_HANDLE;
@@ -656,6 +800,9 @@ VkCommandBuffer mtl_begin_command_buffer_internal(MtlCommandBufferImpl *cb);
 bool            mtl_acquire_swapchain_image_internal(MtlMetalLayerImpl *layer, uint32_t *out_sc_idx, VkSemaphore *out_wait_sem);
 bool            mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed);
 bool            mtl_alloc_inline_bytes(MtlCommandBufferImpl *cb, const void *data, uint64_t len, VkBuffer *out_buf, uint64_t *out_off);
+void            mtl_sync_buffer_backed_texture_if_dirty(MtlTextureImpl *tex);
+void            mtl_sync_all_dirty_buffer_textures_cmd(MtlCommandBufferImpl *cb);
+void            mtl_flush_pending_tex_uploads_cmd(MtlCommandBufferImpl *cb);
 
 } // namespace oh2::mtlvk
 

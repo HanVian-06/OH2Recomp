@@ -57,6 +57,8 @@ static std::atomic<int>      g_live_loop_mode{0};
 static std::atomic<int>      g_live_loop_running{0};
 static std::atomic<uint32_t> g_screen_w_px{2340};
 static std::atomic<uint32_t> g_screen_h_px{1080};
+static std::atomic<uint32_t> g_phys_w_px{2340};
+static std::atomic<uint32_t> g_phys_h_px{1080};
 static double                g_screen_scale = 2.0;
 
 static std::atomic<int>             g_vsync_driven{0};
@@ -719,6 +721,16 @@ void oh2_ui_get_screen_dimensions(uint32_t *out_w_px, uint32_t *out_h_px, double
     if (out_w_px) *out_w_px = g_screen_w_px.load();
     if (out_h_px) *out_h_px = g_screen_h_px.load();
     if (out_scale) *out_scale = g_screen_scale;
+}
+
+void oh2_ui_set_physical_dimensions(uint32_t width_px, uint32_t height_px) {
+    if (width_px > 0) g_phys_w_px.store(width_px);
+    if (height_px > 0) g_phys_h_px.store(height_px);
+}
+
+void oh2_ui_get_physical_dimensions(uint32_t *out_w_px, uint32_t *out_h_px) {
+    if (out_w_px) *out_w_px = g_phys_w_px.load();
+    if (out_h_px) *out_h_px = g_phys_h_px.load();
 }
 
 void *oh2_ui_get_active_ios_view(void) {

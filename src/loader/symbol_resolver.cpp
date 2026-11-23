@@ -304,6 +304,23 @@ static std::unordered_map<const DarwinObjCClass *, std::unordered_map<std::strin
 static std::unordered_set<uint64_t> g_logged_missing_sels;
 static std::unordered_map<uint64_t, std::unordered_map<const void *, void *>> g_assoc_objects;
 
+struct alignas(32) ObjcFastCacheEntry {
+    const DarwinObjCClass *cls;
+    const char            *sel;
+    void                  *imp;
+    uint64_t               epoch;
+};
+static constexpr size_t kObjcFastCacheSize = 16384; /* 512 KiB, mask = 0x3fff */
+
+} // namespace
+
+extern "C" {
+alignas(64) __attribute__((visibility("hidden"))) ObjcFastCacheEntry g_objc_fast_cache[kObjcFastCacheSize] = {};
+__attribute__((visibility("hidden"))) uint64_t g_objc_fast_cache_epoch = 1;
+}
+
+namespace {
+
 static const char *intern_selector(const char *name) {
     if (!name) return "";
     auto it = g_sel_pool.insert(name).first;
@@ -315,6 +332,7 @@ static void register_method_locked(DarwinObjCClass *cls, const char *sel_name, v
     const char *isel = intern_selector(sel_name);
     g_method_table[cls][isel] = imp;
     g_method_table_str[cls][sel_name] = imp;
+    __atomic_add_fetch(&g_objc_fast_cache_epoch, 1ULL, __ATOMIC_RELEASE);
 }
 
 static void register_instance_method(DarwinObjCClass *cls, const char *sel_name, void *imp) {
@@ -349,21 +367,38 @@ static bool is_valid_class_ptr(const void *p) {
     return true;
 }
 
+static std::atomic<uintptr_t> g_cached_macho_base{0};
+static std::atomic<uintptr_t> g_cached_macho_end{0};
+
+static inline bool is_block_fast(const void *obj) {
+    const void *isa = *(void * const *)obj;
+    return (isa == (const void *)&__NSConcreteStackBlock ||
+            isa == (const void *)&__NSConcreteMallocBlock ||
+            isa == (const void *)&__NSConcreteGlobalBlock);
+}
+
 static DarwinObjCPrefix *get_heap_prefix(const void *obj) {
     if (!obj) return nullptr;
     uintptr_t v = (uintptr_t)obj;
     if (v < 0x10000ULL || (v & 0x7ULL) != 0) return nullptr;
-    if (oh2_objc_is_block(obj)) return nullptr;
-    const MachOImage *img = macho_get_active_image();
-    if (img && img->base_addr) {
-        uintptr_t base = (uintptr_t)img->base_addr;
-        if (v >= base && v < base + img->mapped_span) {
-            return nullptr; /* Inside static Mach-O segments */
+    if (__builtin_expect(is_block_fast(obj), 0)) return nullptr;
+    uintptr_t mbase = g_cached_macho_base.load(std::memory_order_relaxed);
+    uintptr_t mend  = g_cached_macho_end.load(std::memory_order_relaxed);
+    if (__builtin_expect(mbase == 0, 0)) {
+        const MachOImage *img = macho_get_active_image();
+        if (img && img->base_addr) {
+            mbase = (uintptr_t)img->base_addr;
+            mend  = mbase + img->mapped_span;
+            g_cached_macho_base.store(mbase, std::memory_order_relaxed);
+            g_cached_macho_end.store(mend, std::memory_order_relaxed);
         }
+    }
+    if (__builtin_expect(v >= mbase && v < mend, 0)) {
+        return nullptr; /* Inside static Mach-O segments */
     }
     /* Check if obj is one of our static external class/metaclass/cfstring globals */
     DarwinObjCPrefix *pfx = ((DarwinObjCPrefix *)const_cast<void *>(obj)) - 1;
-    if (pfx->magic == OH2_OBJC_HEAP_MAGIC) {
+    if (__builtin_expect(pfx->magic == OH2_OBJC_HEAP_MAGIC, 1)) {
         return pfx;
     }
     return nullptr;
@@ -464,8 +499,34 @@ extern "C" const char *darwin_cfstring_utf8(const void *cfstr_obj, char *scratch
     return "<Object>";
 }
 
+static inline void store_objc_fast_cache(const DarwinObjCClass *cls, const char *sel, void *imp, uint64_t ep, size_t hidx) {
+    std::lock_guard<std::mutex> lk(g_objc_mutex);
+    if (__atomic_load_n(&g_objc_fast_cache_epoch, __ATOMIC_ACQUIRE) != ep) return;
+    size_t candidates[2] = { hidx, hidx ^ 1u };
+    for (size_t idx : candidates) {
+        ObjcFastCacheEntry &ce = g_objc_fast_cache[idx];
+        if (__atomic_load_n(&ce.imp, __ATOMIC_RELAXED) == nullptr) {
+            ce.cls = cls;
+            ce.sel = sel;
+            ce.epoch = ep;
+            __atomic_store_n(&ce.imp, imp, __ATOMIC_RELEASE);
+            return;
+        }
+    }
+}
+
 static void *lookup_imp_from_class(const DarwinObjCClass *start_cls, const char *sel) {
     if (!start_cls || !sel) return (void *)&darwin_objc_fallback_imp;
+
+    const uint64_t ep = __atomic_load_n(&g_objc_fast_cache_epoch, __ATOMIC_ACQUIRE);
+    const size_t hidx = ((((uintptr_t)start_cls >> 4) ^ ((uintptr_t)sel >> 2) ^ ((uintptr_t)sel >> 11)) & (kObjcFastCacheSize - 1));
+    for (size_t probe = 0; probe < 2; ++probe) {
+        const ObjcFastCacheEntry &ce = g_objc_fast_cache[hidx ^ probe];
+        void *cimp = __atomic_load_n(&ce.imp, __ATOMIC_ACQUIRE);
+        if (__builtin_expect(cimp != nullptr && ce.cls == start_cls && ce.sel == sel && ce.epoch == ep, 1)) {
+            return cimp;
+        }
+    }
 
     const DarwinObjCClass *cur = start_cls;
     int depth = 0;
@@ -474,6 +535,7 @@ static void *lookup_imp_from_class(const DarwinObjCClass *start_cls, const char 
         if (it_cls != g_method_table.end()) {
             auto it_m = it_cls->second.find(sel);
             if (it_m != it_cls->second.end()) {
+                store_objc_fast_cache(start_cls, sel, it_m->second, ep, hidx);
                 return it_m->second;
             }
         }
@@ -481,6 +543,7 @@ static void *lookup_imp_from_class(const DarwinObjCClass *start_cls, const char 
         if (it_str_cls != g_method_table_str.end()) {
             auto it_sm = it_str_cls->second.find(sel);
             if (it_sm != it_str_cls->second.end()) {
+                store_objc_fast_cache(start_cls, sel, it_sm->second, ep, hidx);
                 return it_sm->second;
             }
         }
@@ -503,7 +566,9 @@ static void *lookup_imp_from_class(const DarwinObjCClass *start_cls, const char 
                      class_get_name_raw(start_cls),
                      sel);
     }
-    return (void *)&darwin_objc_fallback_imp;
+    void *fb = (void *)&darwin_objc_fallback_imp;
+    store_objc_fast_cache(start_cls, sel, fb, ep, hidx);
+    return fb;
 }
 
 extern "C" void *darwin_objc_lookup_imp(void *self, const char *sel) {
@@ -908,7 +973,27 @@ static int darwin_NSGetExecutablePath(char *buf, uint32_t *bufsize) {
     return 0;
 }
 
+static uint64_t get_arm64_cntfrq(void) {
+#if defined(__aarch64__)
+    static uint64_t s_freq = []() -> uint64_t {
+        uint64_t f = 0;
+        asm volatile("mrs %0, cntfrq_el0" : "=r"(f));
+        return f;
+    }();
+    return s_freq;
+#else
+    return 0;
+#endif
+}
+
 static uint64_t darwin_mach_absolute_time(void) {
+#if defined(__aarch64__)
+    if (__builtin_expect(get_arm64_cntfrq() != 0, 1)) {
+        uint64_t cnt = 0;
+        asm volatile("mrs %0, cntvct_el0" : "=r"(cnt));
+        return cnt;
+    }
+#endif
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
@@ -921,13 +1006,25 @@ struct DarwinMachTimebaseInfo {
 
 static int darwin_mach_timebase_info(DarwinMachTimebaseInfo *info) {
     if (info) {
-        info->numer = 1;
-        info->denom = 1;
+        uint64_t freq = get_arm64_cntfrq();
+        if (freq > 0) {
+            uint64_t a = 1000000000ULL, b = freq;
+            while (b != 0) { uint64_t t = a % b; a = b; b = t; }
+            info->numer = (uint32_t)(1000000000ULL / a);
+            info->denom = (uint32_t)(freq / a);
+        } else {
+            info->numer = 1;
+            info->denom = 1;
+        }
     }
     return 0;
 }
 
 static double darwin_CACurrentMediaTime(void) {
+    uint64_t freq = get_arm64_cntfrq();
+    if (freq > 0) {
+        return (double)darwin_mach_absolute_time() / (double)freq;
+    }
     return (double)darwin_mach_absolute_time() * 1e-9;
 }
 
@@ -1660,7 +1757,8 @@ static void *darwin_objc_alloc(DarwinObjCClass *cls) {
 
 static void *darwin_objc_retain(void *obj) {
     if (!obj) return nullptr;
-    if (oh2_objc_is_block(obj)) {
+    uintptr_t v = (uintptr_t)obj;
+    if (v >= 0x10000ULL && (v & 0x7ULL) == 0 && __builtin_expect(is_block_fast(obj), 0)) {
         typedef void *(*bcopy_t)(const void *);
         static bcopy_t fn = (bcopy_t)darwin_resolve_symbol(nullptr, "__Block_copy");
         return fn ? fn(obj) : obj;
@@ -3426,7 +3524,8 @@ extern "C" void oh2_objc_register_autorelease_hook(void *(*hook)(void *obj)) {
 
 extern "C" void oh2_objc_release_object(void *obj) {
     if (!obj) return;
-    if (oh2_objc_is_block(obj)) {
+    uintptr_t v = (uintptr_t)obj;
+    if (v >= 0x10000ULL && (v & 0x7ULL) == 0 && __builtin_expect(is_block_fast(obj), 0)) {
         typedef void (*brel_t)(const void *);
         static brel_t fn = (brel_t)darwin_resolve_symbol(nullptr, "__Block_release");
         if (fn) fn(obj);

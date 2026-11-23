@@ -255,6 +255,10 @@ static void *mtl_device_newBufferWithBytes(void *self, const char *sel, const vo
     if (impl && impl->mapped && ptr && length > 0) {
         std::memcpy(impl->mapped, ptr, (size_t)length);
         vmaFlushAllocation(get_state().vk_ctx.allocator(), impl->allocation, 0, length);
+        impl->mod_gen.fetch_add(1, std::memory_order_relaxed);
+        if (!impl->buffer_views.empty()) {
+            get_state().any_buf_tex_dirty.store(true, std::memory_order_release);
+        }
     }
     return buf_obj;
 }
@@ -267,8 +271,14 @@ static void *mtl_device_newBufferNoCopy(void *self, const char *sel, void *ptr, 
 static void *mtl_buffer_contents(void *self, const char *sel) {
     (void)sel;
     auto *impl = unwrap_mtl<MtlBufferImpl>(self);
-    if (impl && impl->allocation) {
-        vmaInvalidateAllocation(get_state().vk_ctx.allocator(), impl->allocation, 0, impl->length);
+    if (impl) {
+        if (impl->needs_host_invalidate.exchange(false, std::memory_order_acq_rel) && impl->allocation) {
+            vmaInvalidateAllocation(get_state().vk_ctx.allocator(), impl->allocation, 0, VK_WHOLE_SIZE);
+        }
+        impl->mod_gen.fetch_add(1, std::memory_order_relaxed);
+        if (!impl->buffer_views.empty()) {
+            get_state().any_buf_tex_dirty.store(true, std::memory_order_release);
+        }
     }
     return impl ? impl->mapped : nullptr;
 }
@@ -279,11 +289,17 @@ static uint64_t mtl_buffer_length(void *self, const char *sel) {
     return impl ? impl->length : 0;
 }
 
+static void upload_buffer_backed_texture_cpu(MtlTextureImpl *tex, MtlBufferImpl *buf);
+
 static void mtl_buffer_didModifyRange(void *self, const char *sel, uint64_t loc, uint64_t len) {
     (void)sel;
     auto *impl = unwrap_mtl<MtlBufferImpl>(self);
     if (impl && impl->allocation && len > 0) {
         vmaFlushAllocation(get_state().vk_ctx.allocator(), impl->allocation, loc, len);
+        impl->mod_gen.fetch_add(1, std::memory_order_relaxed);
+        if (!impl->buffer_views.empty()) {
+            get_state().any_buf_tex_dirty.store(true, std::memory_order_release);
+        }
     }
 }
 
@@ -344,6 +360,15 @@ static void mtl_tex_dealloc(void *self) {
         oh2_objc_release_object(tex->parent_tex_obj);
     }
     if (tex->retains_parent_buf && tex->parent_buffer_obj) {
+        {
+            std::lock_guard<std::mutex> blk(st.buf_tex_mutex);
+            auto &ab = st.active_buf_textures;
+            ab.erase(std::remove(ab.begin(), ab.end(), tex), ab.end());
+        }
+        if (auto *pbuf = unwrap_mtl<MtlBufferImpl>(tex->parent_buffer_obj)) {
+            auto &bv = pbuf->buffer_views;
+            bv.erase(std::remove(bv.begin(), bv.end(), tex), bv.end());
+        }
         oh2_objc_release_object(tex->parent_buffer_obj);
     }
     delete tex;
@@ -547,6 +572,107 @@ static void *mtl_device_newTexture(void *self, const char *sel, void *desc_obj) 
     return alloc_mtl_wrap_managed("MTLTexture", tex, &mtl_tex_dealloc, false);
 }
 
+static uint64_t hash_buffer_tex_slice(const MtlTextureImpl *tex, const MtlBufferImpl *buf) {
+    if (!tex || !buf || !buf->mapped || tex->buffer_offset >= buf->length) return 0;
+    uint32_t w = std::max(1u, tex->width);
+    uint32_t h = std::max(1u, tex->height);
+    uint32_t d = std::max(1u, tex->depth);
+    uint32_t bw = 1, bh = 1;
+    uint32_t bsz = mtl_pixel_format_block_size(tex->vk_format, &bw, &bh);
+    uint64_t packed_row = static_cast<uint64_t>((w + bw - 1u) / bw) * bsz;
+    uint64_t rows = static_cast<uint64_t>((h + bh - 1u) / bh) * d;
+    uint64_t pitch = (tex->buffer_bytes_per_row > 0) ? tex->buffer_bytes_per_row : packed_row;
+    uint64_t avail = buf->length - tex->buffer_offset;
+    uint64_t span = std::min<uint64_t>(avail, (rows > 1) ? ((rows - 1) * pitch + packed_row) : packed_row);
+    const uint8_t *p = static_cast<const uint8_t *>(buf->mapped) + tex->buffer_offset;
+    uint64_t hash = 14695981039346656037ULL ^ span;
+    uint64_t step = (span > 256) ? (span / 32) : 8;
+    if (step < 8) step = 8;
+    for (uint64_t off = 0; off + 8 <= span; off += step) {
+        uint64_t v = 0;
+        std::memcpy(&v, p + off, 8);
+        hash ^= v;
+        hash *= 1099511628211ULL;
+    }
+    if (span >= 8) {
+        uint64_t tail = 0;
+        std::memcpy(&tail, p + span - 8, 8);
+        hash ^= tail;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static void upload_buffer_backed_texture_cpu(MtlTextureImpl *tex, MtlBufferImpl *buf) {
+    MtlVkState &st = get_state();
+    if (!tex || !buf || !buf->mapped || tex->image == VK_NULL_HANDLE || !st.initialized) return;
+    if (tex->buffer_offset >= buf->length) return;
+
+    uint32_t w = std::max(1u, tex->width);
+    uint32_t h = std::max(1u, tex->height);
+    uint32_t d = std::max(1u, tex->depth);
+    uint32_t bw = 1, bh = 1;
+    uint32_t bsz = mtl_pixel_format_block_size(tex->vk_format, &bw, &bh);
+    uint32_t bx = (w + bw - 1u) / bw;
+    uint32_t by = (h + bh - 1u) / bh;
+    uint64_t packed_row = static_cast<uint64_t>(bx) * bsz;
+    uint64_t src_row_pitch = (tex->buffer_bytes_per_row > 0) ? tex->buffer_bytes_per_row : packed_row;
+    uint64_t total_packed = packed_row * by * d;
+    if (total_packed == 0) return;
+
+    uint64_t cur_gen = buf->mod_gen.load(std::memory_order_relaxed);
+    uint64_t cur_hash = hash_buffer_tex_slice(tex, buf);
+
+    oh2::vk::StagingAllocation staging{};
+    if (!st.staging.allocate(total_packed, std::max<VkDeviceSize>(16, st.vk_ctx.caps().optimal_buffer_copy_offset_alignment), staging)) {
+        return;
+    }
+
+    const uint8_t *src_base = static_cast<const uint8_t *>(buf->mapped) + tex->buffer_offset;
+    uint64_t avail = buf->length - tex->buffer_offset;
+    uint8_t *dst_base = static_cast<uint8_t *>(staging.mapped);
+    std::memset(dst_base, 0, static_cast<size_t>(total_packed));
+
+    for (uint32_t row = 0; row < by * d; ++row) {
+        uint64_t src_off = static_cast<uint64_t>(row) * src_row_pitch;
+        if (src_off >= avail) break;
+        uint64_t can_copy = std::min<uint64_t>(packed_row, avail - src_off);
+        std::memcpy(dst_base + static_cast<uint64_t>(row) * packed_row, src_base + src_off, static_cast<size_t>(can_copy));
+    }
+    st.staging.flush(staging.offset, total_packed);
+
+    struct BufTexUploadCtx {
+        MtlTextureImpl *tex;
+        oh2::vk::StagingAllocation staging;
+        uint32_t w, h, d;
+    } ctx{tex, staging, w, h, d};
+
+    execute_immediate_upload([](VkCommandBuffer cmd, void *ud) {
+        auto *c = static_cast<BufTexUploadCtx *>(ud);
+        VkImageLayout old_l = c->tex->mip_layouts.empty() ? VK_IMAGE_LAYOUT_UNDEFINED : c->tex->mip_layouts[0];
+        transition_image_layout(cmd, c->tex->image, c->tex->aspect_mask,
+                                0, 1, 0, 1,
+                                old_l, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+        VkBufferImageCopy bic{};
+        bic.bufferOffset = c->staging.offset;
+        bic.bufferRowLength = 0;
+        bic.bufferImageHeight = 0;
+        bic.imageSubresource = {c->tex->aspect_mask, 0, 0, 1};
+        bic.imageOffset = {0, 0, 0};
+        bic.imageExtent = {c->w, c->h, c->d};
+        vkCmdCopyBufferToImage(cmd, c->staging.buffer, c->tex->image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+
+        transition_image_layout(cmd, c->tex->image, c->tex->aspect_mask,
+                                0, 1, 0, 1,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (!c->tex->mip_layouts.empty()) c->tex->mip_layouts[0] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }, &ctx);
+    tex->synced_buf_gen = cur_gen;
+    tex->synced_content_hash = cur_hash;
+}
+
 static void *mtl_buffer_newTextureWithDescriptor(void *self, const char *sel, void *desc_obj, uint64_t offset, uint64_t bytesPerRow) {
     (void)sel;
     auto *buf = unwrap_mtl<MtlBufferImpl>(self);
@@ -559,11 +685,19 @@ static void *mtl_buffer_newTextureWithDescriptor(void *self, const char *sel, vo
         if (self) oh2_objc_add_refcount(self, 1);
         tex->buffer_offset = offset;
         tex->buffer_bytes_per_row = bytesPerRow;
+        if (buf) {
+            buf->buffer_views.push_back(tex);
+            std::lock_guard<std::mutex> blk(get_state().buf_tex_mutex);
+            get_state().active_buf_textures.push_back(tex);
+        }
         if (buf && buf->mapped && tex->width > 0 && tex->height > 0) {
             uint64_t avail = (offset < buf->length) ? (buf->length - offset) : 0;
             int64_t delta = static_cast<int64_t>(avail) - static_cast<int64_t>(tex->allocated_size);
             tex->allocated_size = avail;
             get_state().live_texture_bytes.fetch_add(delta, std::memory_order_relaxed);
+            tex->synced_buf_gen = 0;
+            tex->synced_content_hash = 0;
+            get_state().any_buf_tex_dirty.store(true, std::memory_order_release);
         }
     }
     return tex_obj;
@@ -585,28 +719,52 @@ static void mtl_tex_replaceRegionSlice(void *self, const char *sel, MTLRegion *r
     uint32_t bsz = mtl_pixel_format_block_size(tex->vk_format, &bw, &bh);
     uint32_t bx = (w + bw - 1u) / bw;
     uint32_t by = (h + bh - 1u) / bh;
-    uint64_t row_bytes = (bytesPerRow > 0) ? bytesPerRow : (uint64_t)bx * bsz;
-    uint64_t total_bytes = row_bytes * by * d;
-    if (total_bytes == 0) return;
+    uint64_t packed_row = (uint64_t)bx * bsz;
+    uint64_t row_bytes = (bytesPerRow > 0) ? bytesPerRow : packed_row;
+    uint64_t packed_total = packed_row * by * d;
+    if (packed_total == 0) return;
 
-    oh2::vk::StagingAllocation staging{};
-    if (!st.staging.allocate(total_bytes, std::max<VkDeviceSize>(16, st.vk_ctx.caps().optimal_buffer_copy_offset_alignment), staging)) {
-        MTLVK_LOGE("replaceRegion: staging allocate(%llu) failed", (unsigned long long)total_bytes);
+    /* Async deferred upload onto the next VkCommandBuffer — zero vkWaitForFences GPU pipeline stalls */
+    if (packed_total <= 16ULL * 1024ULL * 1024ULL) {
+        PendingTexUpload item{};
+        item.tex_obj = self;
+        item.level = (uint32_t)level;
+        item.slice = (uint32_t)slice;
+        item.reg = *region;
+        item.bytes.resize(static_cast<size_t>(packed_total));
+        if (row_bytes == packed_row) {
+            std::memcpy(item.bytes.data(), bytes, static_cast<size_t>(packed_total));
+        } else {
+            const uint8_t *src = static_cast<const uint8_t *>(bytes);
+            uint8_t *dst = item.bytes.data();
+            for (uint32_t row = 0; row < by * d; ++row) {
+                std::memcpy(dst + row * packed_row, src + row * row_bytes, static_cast<size_t>(packed_row));
+            }
+        }
+        oh2_objc_add_refcount(self, 1);
+        {
+            std::lock_guard<std::mutex> plk(st.pending_tex_mutex);
+            st.pending_tex_uploads.push_back(std::move(item));
+        }
+        st.has_pending_tex_uploads.store(true, std::memory_order_release);
         return;
     }
 
-    if (row_bytes == (uint64_t)bx * bsz) {
-        std::memcpy(staging.mapped, bytes, (size_t)total_bytes);
+    oh2::vk::StagingAllocation staging{};
+    if (!st.staging.allocate(packed_total, std::max<VkDeviceSize>(16, st.vk_ctx.caps().optimal_buffer_copy_offset_alignment), staging)) {
+        MTLVK_LOGE("replaceRegion: staging allocate(%llu) failed", (unsigned long long)packed_total);
+        return;
+    }
+    if (row_bytes == packed_row) {
+        std::memcpy(staging.mapped, bytes, (size_t)packed_total);
     } else {
         const uint8_t *src = static_cast<const uint8_t *>(bytes);
         uint8_t *dst = static_cast<uint8_t *>(staging.mapped);
-        uint64_t packed_row = (uint64_t)bx * bsz;
         for (uint32_t row = 0; row < by * d; ++row) {
             std::memcpy(dst + row * packed_row, src + row * row_bytes, (size_t)packed_row);
         }
-        total_bytes = packed_row * by * d;
     }
-    st.staging.flush(staging.offset, total_bytes);
+    st.staging.flush(staging.offset, packed_total);
 
     struct CopyCtx {
         MtlTextureImpl *tex;
@@ -976,9 +1134,10 @@ static MtlMetalLayerImpl *ensure_layer_impl(void *self) {
     if (!w) return nullptr;
     if (!w->impl) {
         w->impl = new MtlMetalLayerImpl();
-        VkExtent2D ext = get_state().vk_ctx.swapchain_extent();
-        w->impl->drawable_width = (double)ext.width;
-        w->impl->drawable_height = (double)ext.height;
+        MtlVkState &st = get_state();
+        VkExtent2D ext = st.vk_ctx.swapchain_extent();
+        w->impl->drawable_width = (double)(st.virtual_render_w > 0 ? st.virtual_render_w : ext.width);
+        w->impl->drawable_height = (double)(st.virtual_render_h > 0 ? st.virtual_render_h : ext.height);
     }
     oh2_objc_mark_immortal(self);
     get_state().shared_layer_obj = self;
@@ -1356,6 +1515,209 @@ void register_resource_objc_methods() {
     oh2_objc_register_instance_method("CAMetalDrawable", "presentAfterMinimumDuration:", (void *)mtl_drawable_presTime);
     oh2_objc_register_instance_method("CAMetalDrawable", "addPresentedHandler:",    (void *)mtl_drawable_addPres);
     oh2_objc_register_instance_method("CAMetalDrawable", "presentedTime",           (void *)mtl_drawable_time);
+}
+
+void mtl_sync_buffer_backed_texture_if_dirty(MtlTextureImpl *tex) {
+    if (!tex || !tex->parent_buffer_obj || tex->image == VK_NULL_HANDLE) return;
+    auto *buf = unwrap_mtl<MtlBufferImpl>(tex->parent_buffer_obj);
+    if (!buf || !buf->mapped) return;
+    uint64_t cur_gen = buf->mod_gen.load(std::memory_order_relaxed);
+    if (tex->synced_buf_gen == cur_gen) return;
+    uint64_t cur_hash = hash_buffer_tex_slice(tex, buf);
+    if (cur_hash != tex->synced_content_hash) {
+        upload_buffer_backed_texture_cpu(tex, buf);
+    } else {
+        tex->synced_buf_gen = cur_gen;
+    }
+}
+
+void mtl_sync_all_dirty_buffer_textures_cmd(MtlCommandBufferImpl *cb) {
+    MtlVkState &st = get_state();
+    if (!cb || !cb->recording || cb->cmd == VK_NULL_HANDLE || !st.initialized) return;
+    if (!st.any_buf_tex_dirty.exchange(false, std::memory_order_acq_rel)) return;
+
+    std::vector<MtlTextureImpl *> snapshot;
+    {
+        std::lock_guard<std::mutex> blk(st.buf_tex_mutex);
+        if (st.active_buf_textures.empty()) return;
+        snapshot = st.active_buf_textures;
+    }
+
+    std::vector<uint8_t> packed_tmp;
+    for (MtlTextureImpl *tex : snapshot) {
+        if (!tex || !tex->parent_buffer_obj || tex->image == VK_NULL_HANDLE) continue;
+        auto *buf = unwrap_mtl<MtlBufferImpl>(tex->parent_buffer_obj);
+        if (!buf || !buf->mapped || tex->buffer_offset >= buf->length) continue;
+        uint64_t cur_gen = buf->mod_gen.load(std::memory_order_relaxed);
+        if (tex->synced_buf_gen == cur_gen) continue;
+
+        uint64_t cur_hash = hash_buffer_tex_slice(tex, buf);
+        if (tex->synced_buf_gen != 0 && cur_hash == tex->synced_content_hash) {
+            tex->synced_buf_gen = cur_gen;
+            continue;
+        }
+
+        uint32_t w = std::max(1u, tex->width);
+        uint32_t h = std::max(1u, tex->height);
+        uint32_t d = std::max(1u, tex->depth);
+        uint32_t bw = 1, bh = 1;
+        uint32_t bsz = mtl_pixel_format_block_size(tex->vk_format, &bw, &bh);
+        uint32_t bx = (w + bw - 1u) / bw;
+        uint32_t by = (h + bh - 1u) / bh;
+        uint64_t packed_row = static_cast<uint64_t>(bx) * bsz;
+        uint64_t src_row_pitch = (tex->buffer_bytes_per_row > 0) ? tex->buffer_bytes_per_row : packed_row;
+        uint64_t total_packed = packed_row * by * d;
+        if (total_packed == 0 || total_packed > 4ULL * 1024ULL * 1024ULL) continue;
+
+        uint64_t avail = buf->length - tex->buffer_offset;
+        uint64_t total_span = (by * d > 1) ? ((uint64_t)(by * d - 1) * src_row_pitch + packed_row) : packed_row;
+        uint64_t align_req = std::max<uint64_t>(4ULL, bsz);
+
+        /* Fast zero-copy path: GPU copies directly from buf->buffer -> tex->image (zero CPU memcpy/alloc!) */
+        if (buf->buffer != VK_NULL_HANDLE &&
+            (tex->buffer_offset % align_req) == 0 &&
+            (src_row_pitch % bsz) == 0 &&
+            avail >= total_span) {
+            uint32_t row_texels = (src_row_pitch == packed_row) ? 0u : static_cast<uint32_t>((src_row_pitch / bsz) * bw);
+            if (row_texels == 0 || (row_texels >= w && row_texels <= 65536u)) {
+                if (buf->allocation) {
+                    vmaFlushAllocation(st.vk_ctx.allocator(), buf->allocation, tex->buffer_offset, total_span);
+                }
+                VkImageLayout old_l = tex->mip_layouts.empty() ? VK_IMAGE_LAYOUT_UNDEFINED : tex->mip_layouts[0];
+                transition_image_layout(cb->cmd, tex->image, tex->aspect_mask,
+                                        0, 1, 0, 1,
+                                        old_l, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                VkBufferImageCopy bic{};
+                bic.bufferOffset = tex->buffer_offset;
+                bic.bufferRowLength = (h > 1) ? row_texels : 0u;
+                bic.bufferImageHeight = 0;
+                bic.imageSubresource = {tex->aspect_mask, 0, 0, 1};
+                bic.imageOffset = {0, 0, 0};
+                bic.imageExtent = {w, h, d};
+                vkCmdCopyBufferToImage(cb->cmd, buf->buffer, tex->image,
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+                transition_image_layout(cb->cmd, tex->image, tex->aspect_mask,
+                                        0, 1, 0, 1,
+                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                if (!tex->mip_layouts.empty()) tex->mip_layouts[0] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                tex->synced_buf_gen = cur_gen;
+                tex->synced_content_hash = cur_hash;
+                st.prof_buftex_uploads.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+        }
+
+        /* Fallback packed copy for unaligned offsets or truncated spans */
+        packed_tmp.assign(static_cast<size_t>(total_packed), 0);
+        const uint8_t *src_base = static_cast<const uint8_t *>(buf->mapped) + tex->buffer_offset;
+        if (src_row_pitch == packed_row && avail >= total_packed) {
+            std::memcpy(packed_tmp.data(), src_base, static_cast<size_t>(total_packed));
+        } else {
+            for (uint32_t row = 0; row < by * d; ++row) {
+                uint64_t src_off = static_cast<uint64_t>(row) * src_row_pitch;
+                if (src_off >= avail) break;
+                uint64_t can_copy = std::min<uint64_t>(packed_row, avail - src_off);
+                std::memcpy(packed_tmp.data() + static_cast<uint64_t>(row) * packed_row,
+                            src_base + src_off, static_cast<size_t>(can_copy));
+            }
+        }
+
+        VkBuffer src_buf = VK_NULL_HANDLE;
+        uint64_t src_off = 0;
+        if (!mtl_alloc_inline_bytes(cb, packed_tmp.data(), total_packed, &src_buf, &src_off)) {
+            continue;
+        }
+
+        VkImageLayout old_l = tex->mip_layouts.empty() ? VK_IMAGE_LAYOUT_UNDEFINED : tex->mip_layouts[0];
+        transition_image_layout(cb->cmd, tex->image, tex->aspect_mask,
+                                0, 1, 0, 1,
+                                old_l, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+        VkBufferImageCopy bic{};
+        bic.bufferOffset = src_off;
+        bic.bufferRowLength = 0;
+        bic.bufferImageHeight = 0;
+        bic.imageSubresource = {tex->aspect_mask, 0, 0, 1};
+        bic.imageOffset = {0, 0, 0};
+        bic.imageExtent = {w, h, d};
+        vkCmdCopyBufferToImage(cb->cmd, src_buf, tex->image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+
+        transition_image_layout(cb->cmd, tex->image, tex->aspect_mask,
+                                0, 1, 0, 1,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (!tex->mip_layouts.empty()) tex->mip_layouts[0] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        tex->synced_buf_gen = cur_gen;
+        tex->synced_content_hash = cur_hash;
+        st.prof_buftex_uploads.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void mtl_flush_pending_tex_uploads_cmd(MtlCommandBufferImpl *cb) {
+    MtlVkState &st = get_state();
+    if (!cb || !cb->recording || cb->cmd == VK_NULL_HANDLE || !st.initialized) return;
+    if (!st.has_pending_tex_uploads.exchange(false, std::memory_order_acq_rel)) return;
+
+    std::vector<PendingTexUpload> batch;
+    {
+        std::lock_guard<std::mutex> plk(st.pending_tex_mutex);
+        batch.swap(st.pending_tex_uploads);
+    }
+    if (batch.empty()) return;
+
+    FrameSyncSlot &slot = st.frames[cb->frame_idx];
+    for (auto &item : batch) {
+        auto *tex = unwrap_mtl<MtlTextureImpl>(item.tex_obj);
+        if (tex && tex->image != VK_NULL_HANDLE && item.level < tex->mip_levels &&
+            item.slice < tex->array_layers && !item.bytes.empty()) {
+            VkBuffer src_buf = VK_NULL_HANDLE;
+            uint64_t src_off = 0;
+            bool ok = false;
+            if (item.bytes.size() <= 2ULL * 1024ULL * 1024ULL) {
+                ok = mtl_alloc_inline_bytes(cb, item.bytes.data(), item.bytes.size(), &src_buf, &src_off);
+            }
+            if (!ok) {
+                oh2::vk::StagingAllocation staging{};
+                if (st.staging.allocate(item.bytes.size(),
+                                        std::max<VkDeviceSize>(16, st.vk_ctx.caps().optimal_buffer_copy_offset_alignment),
+                                        staging)) {
+                    std::memcpy(staging.mapped, item.bytes.data(), item.bytes.size());
+                    st.staging.flush(staging.offset, item.bytes.size());
+                    src_buf = staging.buffer;
+                    src_off = staging.offset;
+                    if (staging.end_cursor > slot.staging_end_cursor) {
+                        slot.staging_end_cursor = staging.end_cursor;
+                    }
+                    ok = true;
+                }
+            }
+            if (ok) {
+                VkImageLayout old_l = tex->mip_layouts[item.level];
+                transition_image_layout(cb->cmd, tex->image, tex->aspect_mask,
+                                        item.level, 1, item.slice, 1,
+                                        old_l, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                VkBufferImageCopy bic{};
+                bic.bufferOffset = src_off;
+                bic.bufferRowLength = 0;
+                bic.bufferImageHeight = 0;
+                bic.imageSubresource.aspectMask = tex->aspect_mask;
+                bic.imageSubresource.mipLevel = item.level;
+                bic.imageSubresource.baseArrayLayer = item.slice;
+                bic.imageSubresource.layerCount = 1;
+                bic.imageOffset = {(int32_t)item.reg.origin.x, (int32_t)item.reg.origin.y, (int32_t)item.reg.origin.z};
+                bic.imageExtent = {(uint32_t)std::max<uint64_t>(1, item.reg.size.width),
+                                   (uint32_t)std::max<uint64_t>(1, item.reg.size.height),
+                                   (uint32_t)std::max<uint64_t>(1, item.reg.size.depth)};
+                vkCmdCopyBufferToImage(cb->cmd, src_buf, tex->image,
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+                transition_image_layout(cb->cmd, tex->image, tex->aspect_mask,
+                                        item.level, 1, item.slice, 1,
+                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                tex->mip_layouts[item.level] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
+        }
+        if (item.tex_obj) oh2_objc_release_object(item.tex_obj);
+    }
 }
 
 } // namespace oh2::mtlvk

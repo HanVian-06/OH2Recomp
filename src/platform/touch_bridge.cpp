@@ -185,9 +185,15 @@ int32_t oh2_platform_handle_input_event(AInputEvent *event) {
     if (pointer_count == 0) return 0;
 
     uint32_t w_px = 0, h_px = 0;
+    uint32_t phys_w = 0, phys_h = 0;
     double scale = 2.0;
     oh2_ui_get_screen_dimensions(&w_px, &h_px, &scale);
+    oh2_ui_get_physical_dimensions(&phys_w, &phys_h);
     if (scale <= 0.0) scale = 2.0;
+    double sx = (phys_w > 0 && w_px > 0) ? ((double)w_px / (double)phys_w) : 1.0;
+    double sy = (phys_h > 0 && h_px > 0) ? ((double)h_px / (double)phys_h) : 1.0;
+    auto map_x_pt = [&](int32_t p_idx) -> double { return ((double)AMotionEvent_getX(event, p_idx) * sx) / scale; };
+    auto map_y_pt = [&](int32_t p_idx) -> double { return ((double)AMotionEvent_getY(event, p_idx) * sy) / scale; };
 
     void *ios_view = oh2_ui_get_active_ios_view();
     void *win = oh2_ui_get_active_window();
@@ -203,8 +209,8 @@ int32_t oh2_platform_handle_input_event(AInputEvent *event) {
         if (action == AMOTION_EVENT_ACTION_DOWN || action == AMOTION_EVENT_ACTION_POINTER_DOWN) {
             int32_t idx = (action == AMOTION_EVENT_ACTION_DOWN) ? 0 : action_idx;
             int32_t pid = AMotionEvent_getPointerId(event, idx);
-            double x_pt = (double)AMotionEvent_getX(event, idx) / scale;
-            double y_pt = (double)AMotionEvent_getY(event, idx) / scale;
+            double x_pt = map_x_pt(idx);
+            double y_pt = map_y_pt(idx);
 
             auto *tp = static_cast<UITouchPayload *>(
                 oh2_objc_alloc_instance(oh2_objc_get_class("UITouch"), sizeof(UITouchPayload)));
@@ -228,8 +234,8 @@ int32_t oh2_platform_handle_input_event(AInputEvent *event) {
         } else if (action == AMOTION_EVENT_ACTION_MOVE) {
             for (size_t i = 0; i < pointer_count; ++i) {
                 int32_t pid = AMotionEvent_getPointerId(event, i);
-                double x_pt = (double)AMotionEvent_getX(event, i) / scale;
-                double y_pt = (double)AMotionEvent_getY(event, i) / scale;
+                double x_pt = map_x_pt((int32_t)i);
+                double y_pt = map_y_pt((int32_t)i);
                 auto it = g_active_touches.find(pid);
                 if (it != g_active_touches.end() && it->second) {
                     auto *tp = static_cast<UITouchPayload *>(it->second);
@@ -261,8 +267,8 @@ int32_t oh2_platform_handle_input_event(AInputEvent *event) {
                 sel_name = "touchesCancelled:withEvent:";
             } else {
                 int32_t pid = AMotionEvent_getPointerId(event, idx);
-                double x_pt = (double)AMotionEvent_getX(event, idx) / scale;
-                double y_pt = (double)AMotionEvent_getY(event, idx) / scale;
+                double x_pt = map_x_pt(idx);
+                double y_pt = map_y_pt(idx);
                 auto it = g_active_touches.find(pid);
                 if (it != g_active_touches.end() && it->second) {
                     auto *tp = static_cast<UITouchPayload *>(it->second);

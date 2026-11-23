@@ -693,6 +693,26 @@ static void *mtl_device_newRenderPipelineState(void *self, const char *sel, void
         }
     }
 
+    /* Precompute shader binding bitmasks for per-slot dirty descriptor tracking */
+    auto compute_stage_masks = [](const SpirvShaderEntry *entry, uint32_t &buf_m, uint32_t &tex_m, uint32_t &smp_m) {
+        buf_m = tex_m = smp_m = 0;
+        if (!entry || !entry->bindings) return;
+        for (uint16_t i = 0; i < entry->binding_count; ++i) {
+            const SpirvBindingDesc &b = entry->bindings[i];
+            uint8_t ms = b.metal_slot;
+            if (b.descriptor_type == SPIRV_VK_DESC_UNIFORM_BUFFER ||
+                b.descriptor_type == SPIRV_VK_DESC_STORAGE_BUFFER) {
+                if (ms < 32) buf_m |= (1u << ms);
+            } else if (b.descriptor_type == SPIRV_VK_DESC_SAMPLER) {
+                if (ms < 32) smp_m |= (1u << ms);
+            } else {
+                if (ms < 32) tex_m |= (1u << ms);
+            }
+        }
+    };
+    compute_stage_masks(pso->vs, pso->vs_used_buf_mask, pso->vs_used_tex_mask, pso->vs_used_smp_mask);
+    compute_stage_masks(pso->ps, pso->ps_used_buf_mask, pso->ps_used_tex_mask, pso->ps_used_smp_mask);
+
     /* Set 0 (VS) & Set 1 (PS) layouts strictly matching M4 spirv_cache.h ABI */
     pso->set0_layout = create_stage_descriptor_layout(pso->vs, VK_SHADER_STAGE_VERTEX_BIT);
     pso->set1_layout = create_stage_descriptor_layout(pso->ps, VK_SHADER_STAGE_FRAGMENT_BIT);
@@ -837,8 +857,7 @@ VkRenderPass get_or_create_render_pass(const VkFormat *color_fmts, uint32_t colo
         ad.loadOp = (color_loads[i] == kMTLLoadActionClear) ? VK_ATTACHMENT_LOAD_OP_CLEAR :
                     (color_loads[i] == kMTLLoadActionLoad)  ? VK_ATTACHMENT_LOAD_OP_LOAD :
                                                               VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        ad.storeOp = (color_stores[i] == kMTLStoreActionDontCare) ? VK_ATTACHMENT_STORE_OP_DONT_CARE :
-                                                                    VK_ATTACHMENT_STORE_OP_STORE;
+        ad.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         ad.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         ad.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         ad.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -856,8 +875,7 @@ VkRenderPass get_or_create_render_pass(const VkFormat *color_fmts, uint32_t colo
         dd.loadOp = (depth_load == kMTLLoadActionClear) ? VK_ATTACHMENT_LOAD_OP_CLEAR :
                     (depth_load == kMTLLoadActionLoad)  ? VK_ATTACHMENT_LOAD_OP_LOAD :
                                                           VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        dd.storeOp = (depth_store == kMTLStoreActionDontCare) ? VK_ATTACHMENT_STORE_OP_DONT_CARE :
-                                                              VK_ATTACHMENT_STORE_OP_STORE;
+        dd.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         dd.stencilLoadOp = dd.loadOp;
         dd.stencilStoreOp = dd.storeOp;
         dd.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -958,11 +976,13 @@ VkPipeline get_or_create_specialized_graphics_pipeline(MtlRenderPipelineStateImp
         const auto &a = pso->vtx_desc_copy.attrs[loc];
         if (a.format == 0) continue;
         bool declared_in_vs = true;
+        uint8_t vs_comp_type = SPIRV_COMP_FLOAT;
         if (pso->vs && pso->vs->vertex_attr_count > 0) {
             declared_in_vs = false;
             for (uint16_t k = 0; k < pso->vs->vertex_attr_count; ++k) {
                 if (pso->vs->vertex_attrs[k].location == (uint8_t)loc) {
                     declared_in_vs = true;
+                    vs_comp_type = pso->vs->vertex_attrs[k].component_type;
                     break;
                 }
             }
@@ -976,6 +996,7 @@ VkPipeline get_or_create_specialized_graphics_pipeline(MtlRenderPipelineStateImp
         vad.format = map_vertex_format(a.format);
         vad.offset = (uint32_t)a.offset;
         vattrs.push_back(vad);
+        (void)vs_comp_type;
 
         if (!used_binding[a.buffer_index]) {
             used_binding[a.buffer_index] = true;
@@ -1170,8 +1191,17 @@ void register_pipeline_objc_methods() {
     oh2_objc_register_instance_method("MTLRenderPassDescriptor", "setRenderTargetArrayLength:",(void *)mtl_pip_noop_u64);
     oh2_objc_register_instance_method("MTLRenderPassDescriptor", "defaultRasterSampleCount",   (void *)mtl_pip_one_u64);
     oh2_objc_register_instance_method("MTLRenderPassDescriptor", "setDefaultRasterSampleCount:", (void *)mtl_pip_noop_u64);
-    oh2_objc_register_instance_method("MTLRenderPassDescriptor", "visibilityResultBuffer",     (void *)mtl_pip_zero_ptr);
-    oh2_objc_register_instance_method("MTLRenderPassDescriptor", "setVisibilityResultBuffer:", (void *)mtl_pip_noop_ptr);
+    static auto mtl_rpd_getVisBuf = +[](void *s, const char *sel) -> void * {
+        (void)sel;
+        auto *d = unwrap_mtl<MtlRenderPassDescImpl>(s);
+        return d ? d->visibility_result_buffer_obj : nullptr;
+    };
+    static auto mtl_rpd_setVisBuf = +[](void *s, const char *sel, void *b) {
+        (void)sel;
+        if (auto *d = unwrap_mtl<MtlRenderPassDescImpl>(s)) d->visibility_result_buffer_obj = b;
+    };
+    oh2_objc_register_instance_method("MTLRenderPassDescriptor", "visibilityResultBuffer",     (void *)mtl_rpd_getVisBuf);
+    oh2_objc_register_instance_method("MTLRenderPassDescriptor", "setVisibilityResultBuffer:", (void *)mtl_rpd_setVisBuf);
     oh2_objc_register_instance_method("MTLRenderPassDescriptor", "imageblockSampleLength",     (void *)mtl_pip_zero_u64);
     oh2_objc_register_instance_method("MTLRenderPassDescriptor", "setImageblockSampleLength:", (void *)mtl_pip_noop_u64);
     oh2_objc_register_instance_method("MTLRenderPassDescriptor", "threadgroupMemoryLength",    (void *)mtl_pip_zero_u64);

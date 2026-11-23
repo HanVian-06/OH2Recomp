@@ -20,7 +20,32 @@
 .global oh2_objc_msgSend
 .type oh2_objc_msgSend, %function
 oh2_objc_msgSend:
-    cbz x0, .Loh2_nil_recv
+    cbz  x0, .Loh2_nil_recv
+    cbz  x1, .Loh2_msg_slow
+    ldr  x9, [x0]
+    tbnz x9, #0, .Loh2_msg_slow
+    cmp  x9, #0x10000
+    b.lo .Loh2_msg_slow
+    lsr  x10, x9, #4
+    eor  x10, x10, x1, lsr #2
+    eor  x10, x10, x1, lsr #11
+    and  x10, x10, #0x3fff
+    adrp x11, g_objc_fast_cache
+    add  x11, x11, :lo12:g_objc_fast_cache
+    add  x11, x11, x10, lsl #5
+    add  x15, x11, #16
+    ldar x16, [x15]
+    cbz  x16, .Loh2_msg_slow
+    ldp  x12, x13, [x11]
+    ldr  x14, [x11, #24]
+    adrp x15, g_objc_fast_cache_epoch
+    ldr  x15, [x15, :lo12:g_objc_fast_cache_epoch]
+    cmp  x12, x9
+    ccmp x13, x1, #0, eq
+    ccmp x14, x15, #0, eq
+    b.ne .Loh2_msg_slow
+    br   x16
+.Loh2_msg_slow:
     stp x29, x30, [sp, #-224]!
     mov x29, sp
     stp x0, x1, [sp, #16]

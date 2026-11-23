@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 #define AUDIO_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "OH2_AUDIO", __VA_ARGS__)
@@ -130,9 +132,14 @@ static uint64_t g_sample_cursor = 0;
 static std::atomic<uint64_t> g_stream_gen{1};
 static void *g_av_audio_session = nullptr;
 
-/* Audio-callback-only static scratch & FIFO buffers (zero heap allocation in RT callback) */
-static constexpr uint32_t kAudioChunkFrames = 256;
-static constexpr size_t   kAudioFifoCap     = 16384;
+/* Dedicated background audio pump thread + lock-free SPSC ring buffer so the real-time
+   AAudio callback never blocks on a mutex or invokes heavy UE4 Vorbis/ADPCM decode callbacks. */
+static constexpr uint32_t kAudioChunkFrames     = 512;
+static constexpr size_t   kAudioFifoCap         = 16384;
+static constexpr size_t   kRingCap              = 16384; /* power of 2 */
+static constexpr size_t   kRingMask             = kRingCap - 1;
+static constexpr size_t   kTargetBufferedFrames = 4096;  /* ~85 ms cushion at 48 kHz */
+
 static int16_t s_bus_i16[kAudioChunkFrames * 2]{};
 static float   s_bus_f32[kAudioChunkFrames * 2]{};
 static float   s_bus_f32_r[kAudioChunkFrames]{};
@@ -142,74 +149,87 @@ static float   s_fifo_L[kAudioFifoCap]{};
 static float   s_fifo_R[kAudioFifoCap]{};
 static size_t  s_fifo_count = 0;
 static double  s_resample_pos = 0.0;
-static uint64_t s_cb_stream_gen = 0;
+static uint64_t s_pump_stream_gen = 0;
+
+static float                 s_ring_L[kRingCap]{};
+static float                 s_ring_R[kRingCap]{};
+static std::atomic<uint64_t> s_ring_write{0};
+static std::atomic<uint64_t> s_ring_read{0};
+static std::atomic<bool>     g_pump_running{false};
+static std::atomic<bool>     g_pump_stop{false};
+static std::thread           g_pump_thread;
 
 static inline float clamp_audio(float x) {
     return (x < -1.0f) ? -1.0f : ((x > 1.0f) ? 1.0f : x);
 }
 
-static aaudio_data_callback_result_t aaudio_cb(AAudioStream *stream, void *user_data,
-                                               void *audio_data, int32_t num_frames) {
-    (void)stream; (void)user_data;
-    if (!audio_data || num_frames <= 0) return AAUDIO_CALLBACK_RESULT_CONTINUE;
+static void audio_pump_thread_fn() {
+    while (!g_pump_stop.load(std::memory_order_acquire)) {
+        if (g_audio_paused.load(std::memory_order_acquire) || !g_audio_active.load(std::memory_order_acquire)) {
+            usleep(4000);
+            continue;
+        }
 
-    const uint64_t cur_gen = g_stream_gen.load(std::memory_order_acquire);
-    if (s_cb_stream_gen != cur_gen) {
-        s_fifo_count = 0;
-        s_resample_pos = 0.0;
-        s_cb_stream_gen = cur_gen;
-    }
+        const uint64_t cur_gen = g_stream_gen.load(std::memory_order_acquire);
+        if (s_pump_stream_gen != cur_gen) {
+            s_fifo_count = 0;
+            s_resample_pos = 0.0;
+            s_ring_read.store(0, std::memory_order_relaxed);
+            s_ring_write.store(0, std::memory_order_release);
+            s_pump_stream_gen = cur_gen;
+        }
 
-    const uint32_t out_ch = (g_active_channels >= 1 && g_active_channels <= 2) ? g_active_channels : 2u;
-    float *out = static_cast<float *>(audio_data);
-    std::memset(out, 0, static_cast<size_t>(num_frames) * out_ch * sizeof(float));
-    if (g_audio_paused.load(std::memory_order_acquire)) {
-        return AAUDIO_CALLBACK_RESULT_CONTINUE;
-    }
+        const uint64_t w_pos = s_ring_write.load(std::memory_order_relaxed);
+        const uint64_t r_pos = s_ring_read.load(std::memory_order_acquire);
+        const size_t buffered = (w_pos >= r_pos) ? static_cast<size_t>(w_pos - r_pos) : 0;
+        if (buffered >= kTargetBufferedFrames) {
+            usleep(2000);
+            continue;
+        }
 
-    ActiveAudioBus active[kMaxAudioBuses];
-    uint32_t active_count = 0;
-    uint32_t src_rate = 44100;
-    float master_vol = 1.0f;
-    {
-        std::lock_guard<std::mutex> lk(g_audio_mutex);
-        src_rate = (g_ue4_sample_rate == 44100 || g_ue4_sample_rate == 48000) ? g_ue4_sample_rate : 44100u;
-        master_vol = g_master_volume;
-        for (uint32_t i = 0; i < kMaxAudioBuses; ++i) {
-            const AudioBus &b = g_buses[i];
-            if (b.has_cb && b.cb && b.enabled) {
-                ActiveAudioBus &ab = active[active_count++];
-                ab.bus_idx = i;
-                ab.cb = b.cb;
-                ab.ref = b.ref;
-                ab.channels = (b.channels == 2) ? 2u : 1u;
-                ab.is_float = b.is_float;
-                ab.is_non_interleaved = b.is_non_interleaved;
-                ab.volume = b.volume;
-                ab.pan = b.pan;
+        ActiveAudioBus active[kMaxAudioBuses];
+        uint32_t active_count = 0;
+        uint32_t src_rate = 44100;
+        float master_vol = 1.0f;
+        {
+            std::lock_guard<std::mutex> lk(g_audio_mutex);
+            src_rate = (g_ue4_sample_rate == 44100 || g_ue4_sample_rate == 48000) ? g_ue4_sample_rate : 44100u;
+            master_vol = g_master_volume;
+            for (uint32_t i = 0; i < kMaxAudioBuses; ++i) {
+                const AudioBus &b = g_buses[i];
+                if (b.has_cb && b.cb && b.enabled) {
+                    ActiveAudioBus &ab = active[active_count++];
+                    ab.bus_idx = i;
+                    ab.cb = b.cb;
+                    ab.ref = b.ref;
+                    ab.channels = (b.channels == 2) ? 2u : 1u;
+                    ab.is_float = b.is_float;
+                    ab.is_non_interleaved = b.is_non_interleaved;
+                    ab.volume = b.volume;
+                    ab.pan = b.pan;
+                }
             }
         }
-    }
 
-    if (active_count == 0) {
-        s_fifo_count = 0;
-        s_resample_pos = 0.0;
-        return AAUDIO_CALLBACK_RESULT_CONTINUE;
-    }
+        if (active_count == 0) {
+            s_fifo_count = 0;
+            s_resample_pos = 0.0;
+            usleep(4000);
+            continue;
+        }
 
-    const uint32_t out_rate = g_aaudio_sample_rate ? g_aaudio_sample_rate : 48000u;
-    const double ratio = static_cast<double>(src_rate) / static_cast<double>(out_rate);
+        const uint32_t out_rate = g_aaudio_sample_rate ? g_aaudio_sample_rate : 48000u;
+        const double ratio = static_cast<double>(src_rate) / static_cast<double>(out_rate);
+        const size_t free_space = (buffered < kRingCap) ? (kRingCap - buffered - 1) : 0;
+        const size_t want_out = std::min<size_t>(kTargetBufferedFrames - buffered, std::min<size_t>(free_space, 1024));
+        if (want_out == 0) {
+            usleep(1000);
+            continue;
+        }
 
-    int32_t written = 0;
-    while (written < num_frames) {
-        const int32_t rem = num_frames - written;
-        const size_t max_out_per_pass = (src_rate == out_rate)
-                                            ? kAudioFifoCap
-                                            : static_cast<size_t>(static_cast<double>(kAudioFifoCap - 4) / std::max(0.5, ratio));
-        const int32_t pass_frames = std::min<int32_t>(rem, static_cast<int32_t>(std::max<size_t>(1, max_out_per_pass)));
         const size_t needed = (src_rate == out_rate)
-                                  ? static_cast<size_t>(pass_frames)
-                                  : static_cast<size_t>(s_resample_pos + static_cast<double>(pass_frames) * ratio) + 2;
+                                  ? want_out
+                                  : static_cast<size_t>(s_resample_pos + static_cast<double>(want_out) * ratio) + 2;
 
         while (s_fifo_count < needed && s_fifo_count + kAudioChunkFrames <= kAudioFifoCap) {
             std::memset(s_mix_L, 0, sizeof(s_mix_L));
@@ -250,7 +270,7 @@ static aaudio_data_callback_result_t aaudio_cb(AAudioStream *stream, void *user_
                     cb_rc = b.cb(b.ref, &action_flags, &ts, b.bus_idx, kAudioChunkFrames, &abl);
                 }
 
-                if (cb_rc != 0 || (action_flags & 0x10u) != 0) { /* kAudioUnitRenderAction_OutputIsSilence */
+                if (cb_rc != 0 || (action_flags & 0x10u) != 0) {
                     continue;
                 }
 
@@ -302,15 +322,14 @@ static aaudio_data_callback_result_t aaudio_cb(AAudioStream *stream, void *user_
             s_fifo_count += kAudioChunkFrames;
         }
 
+        uint64_t cur_w = w_pos;
         if (src_rate == out_rate) {
-            const size_t avail = std::min<size_t>(s_fifo_count, static_cast<size_t>(pass_frames));
+            const size_t avail = std::min<size_t>(s_fifo_count, want_out);
             for (size_t i = 0; i < avail; ++i) {
-                if (out_ch == 1) {
-                    out[written + i] = 0.5f * (s_fifo_L[i] + s_fifo_R[i]);
-                } else {
-                    out[(written + i) * 2 + 0] = s_fifo_L[i];
-                    out[(written + i) * 2 + 1] = s_fifo_R[i];
-                }
+                const size_t slot = static_cast<size_t>(cur_w & kRingMask);
+                s_ring_L[slot] = s_fifo_L[i];
+                s_ring_R[slot] = s_fifo_R[i];
+                cur_w++;
             }
             if (avail < s_fifo_count) {
                 const size_t left = s_fifo_count - avail;
@@ -319,7 +338,7 @@ static aaudio_data_callback_result_t aaudio_cb(AAudioStream *stream, void *user_
             }
             s_fifo_count -= avail;
         } else {
-            for (int32_t i = 0; i < pass_frames; ++i) {
+            for (size_t i = 0; i < want_out; ++i) {
                 if (s_fifo_count == 0) break;
                 size_t idx = static_cast<size_t>(s_resample_pos);
                 if (idx >= s_fifo_count) idx = s_fifo_count - 1;
@@ -327,12 +346,10 @@ static aaudio_data_callback_result_t aaudio_cb(AAudioStream *stream, void *user_
                 const float frac = static_cast<float>(s_resample_pos - static_cast<double>(idx));
                 const float l = s_fifo_L[idx] + (s_fifo_L[idx1] - s_fifo_L[idx]) * frac;
                 const float r = s_fifo_R[idx] + (s_fifo_R[idx1] - s_fifo_R[idx]) * frac;
-                if (out_ch == 1) {
-                    out[written + i] = 0.5f * (l + r);
-                } else {
-                    out[(written + i) * 2 + 0] = l;
-                    out[(written + i) * 2 + 1] = r;
-                }
+                const size_t slot = static_cast<size_t>(cur_w & kRingMask);
+                s_ring_L[slot] = l;
+                s_ring_R[slot] = r;
+                cur_w++;
                 s_resample_pos += ratio;
             }
             const size_t consumed = std::min(s_fifo_count, static_cast<size_t>(s_resample_pos));
@@ -346,9 +363,45 @@ static aaudio_data_callback_result_t aaudio_cb(AAudioStream *stream, void *user_
                 s_resample_pos -= static_cast<double>(consumed);
             }
         }
-        written += pass_frames;
+        s_ring_write.store(cur_w, std::memory_order_release);
+    }
+}
+
+static void ensure_pump_thread_started() {
+    bool expected = false;
+    if (g_pump_running.compare_exchange_strong(expected, true)) {
+        g_pump_stop.store(false, std::memory_order_release);
+        g_pump_thread = std::thread(audio_pump_thread_fn);
+    }
+}
+
+static aaudio_data_callback_result_t aaudio_cb(AAudioStream *stream, void *user_data,
+                                               void *audio_data, int32_t num_frames) {
+    (void)stream; (void)user_data;
+    if (!audio_data || num_frames <= 0) return AAUDIO_CALLBACK_RESULT_CONTINUE;
+
+    const uint32_t out_ch = (g_active_channels >= 1 && g_active_channels <= 2) ? g_active_channels : 2u;
+    float *out = static_cast<float *>(audio_data);
+    std::memset(out, 0, static_cast<size_t>(num_frames) * out_ch * sizeof(float));
+    if (g_audio_paused.load(std::memory_order_acquire)) {
+        return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
 
+    const uint64_t w_pos = s_ring_write.load(std::memory_order_acquire);
+    uint64_t r_pos = s_ring_read.load(std::memory_order_relaxed);
+    const size_t avail = (w_pos >= r_pos) ? static_cast<size_t>(w_pos - r_pos) : 0;
+    const size_t to_read = std::min<size_t>(avail, static_cast<size_t>(num_frames));
+
+    for (size_t i = 0; i < to_read; ++i) {
+        const size_t slot = static_cast<size_t>((r_pos + i) & kRingMask);
+        if (out_ch == 1) {
+            out[i] = 0.5f * (s_ring_L[slot] + s_ring_R[slot]);
+        } else {
+            out[i * 2 + 0] = s_ring_L[slot];
+            out[i * 2 + 1] = s_ring_R[slot];
+        }
+    }
+    s_ring_read.store(r_pos + to_read, std::memory_order_release);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -392,6 +445,7 @@ static bool start_aaudio_locked(std::unique_lock<std::mutex> &lk, uint32_t req_r
     AAudioStreamBuilder_setSampleRate(builder, static_cast<int32_t>(rate));
     AAudioStreamBuilder_setChannelCount(builder, 2);
     AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
+    AAudioStreamBuilder_setBufferCapacityInFrames(builder, 4096);
     AAudioStreamBuilder_setDataCallback(builder, aaudio_cb, nullptr);
 
     AAudioStream *new_stream = nullptr;
@@ -402,11 +456,17 @@ static bool start_aaudio_locked(std::unique_lock<std::mutex> &lk, uint32_t req_r
         return false;
     }
 
+    int32_t burst = AAudioStream_getFramesPerBurst(new_stream);
+    if (burst > 0) {
+        AAudioStream_setBufferSizeInFrames(new_stream, std::max<int32_t>(1024, burst * 4));
+    }
+
     g_aaudio_stream = new_stream;
     g_last_requested_rate = rate;
     g_aaudio_sample_rate = static_cast<uint32_t>(AAudioStream_getSampleRate(new_stream));
     g_active_channels = static_cast<uint32_t>(AAudioStream_getChannelCount(new_stream));
     g_stream_gen.fetch_add(1, std::memory_order_release);
+    ensure_pump_thread_started();
 
     res = AAudioStream_requestStart(new_stream);
     if (res != AAUDIO_OK) {
@@ -747,6 +807,11 @@ void oh2_platform_audio_resume(void) {
 }
 
 void oh2_platform_audio_shutdown(void) {
+    g_pump_stop.store(true, std::memory_order_release);
+    if (g_pump_thread.joinable()) {
+        g_pump_thread.join();
+    }
+    g_pump_running.store(false, std::memory_order_release);
     AAudioStream *s = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_audio_mutex);

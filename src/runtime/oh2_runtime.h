@@ -37,6 +37,8 @@ void  oh2_set_ios_main_thread(void);
 int   oh2_is_ios_main_thread(void);
 void  oh2_ui_set_screen_dimensions(uint32_t width_px, uint32_t height_px, double scale);
 void  oh2_ui_get_screen_dimensions(uint32_t *out_w_px, uint32_t *out_h_px, double *out_scale);
+void  oh2_ui_set_physical_dimensions(uint32_t width_px, uint32_t height_px);
+void  oh2_ui_get_physical_dimensions(uint32_t *out_w_px, uint32_t *out_h_px);
 void *oh2_ui_get_active_ios_view(void);
 void  oh2_ui_set_active_ios_view(void *view);
 void *oh2_ui_get_active_window(void);

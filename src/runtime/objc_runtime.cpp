@@ -48,13 +48,16 @@ static pthread_mutex_t *get_or_create_sync_lock(const void *obj) {
 }
 
 /* ============================================================================
- * 2. Thread-local NSAutoreleasePool stack & ARC retain/release
+ * 2. Thread-local NSAutoreleasePool stack & ARC retain/release (POD, zero-alloc)
  * ============================================================================ */
-struct AutoreleaseFrame {
-    std::vector<void *> objects;
+struct FastArpState {
+    void   **objs;
+    uint32_t count;
+    uint32_t cap;
+    uint32_t depth;
 };
 
-static thread_local std::vector<AutoreleaseFrame> tl_autorelease_stack;
+static thread_local FastArpState tl_arp = {nullptr, 0, 0, 0};
 
 /* ============================================================================
  * 3. Blocks (_Block_copy / _Block_release)
@@ -162,29 +165,33 @@ static void oh2_dispatch_release(void *obj) {
 
 static void *oh2_objc_autorelease(void *obj) {
     if (!obj) return nullptr;
-    if (!tl_autorelease_stack.empty()) {
-        tl_autorelease_stack.back().objects.push_back(obj);
+    if (tl_arp.depth > 0) {
+        if (__builtin_expect(tl_arp.count >= tl_arp.cap, 0)) {
+            uint32_t new_cap = (tl_arp.cap == 0) ? 256u : (tl_arp.cap * 2u);
+            void **nb = (void **)realloc(tl_arp.objs, (size_t)new_cap * sizeof(void *));
+            if (!nb) return obj;
+            tl_arp.objs = nb;
+            tl_arp.cap = new_cap;
+        }
+        tl_arp.objs[tl_arp.count++] = obj;
     }
     return obj;
 }
 
 static void *oh2_objc_autoreleasePoolPush(void) {
-    tl_autorelease_stack.emplace_back();
-    return (void *)(uintptr_t)tl_autorelease_stack.size();
+    tl_arp.depth++;
+    return (void *)(uintptr_t)(tl_arp.count + 1u);
 }
 
 static void oh2_objc_autoreleasePoolPop(void *pool_token) {
-    if (tl_autorelease_stack.empty()) return;
-    size_t target_depth = (size_t)(uintptr_t)pool_token;
-    if (target_depth == 0 || target_depth > tl_autorelease_stack.size()) {
-        target_depth = tl_autorelease_stack.size();
-    }
-    while (tl_autorelease_stack.size() >= target_depth && !tl_autorelease_stack.empty()) {
-        AutoreleaseFrame frame = std::move(tl_autorelease_stack.back());
-        tl_autorelease_stack.pop_back();
-        for (void *obj : frame.objects) {
-            oh2_objc_release(obj);
-        }
+    if (tl_arp.depth > 0) tl_arp.depth--;
+    uintptr_t tok = (uintptr_t)pool_token;
+    if (tok == 0) return;
+    uint32_t target = (uint32_t)(tok - 1u);
+    if (__builtin_expect(tl_arp.count <= target, 1)) return;
+    while (tl_arp.count > target) {
+        void *obj = tl_arp.objs[--tl_arp.count];
+        oh2_objc_release_object(obj);
     }
 }
 
