@@ -31,6 +31,7 @@ enum SpirvShaderEntryFlags {
     SPIRV_ENTRY_FLAG_RELAXED_PRECISION = (1u << 3),
     SPIRV_ENTRY_FLAG_FRAG_DEPTH        = (1u << 4),
     SPIRV_ENTRY_FLAG_FB_FETCH          = (1u << 5),
+    SPIRV_ENTRY_FLAG_FB_FETCH_RGB      = (1u << 6),
 };
 
 /* Metal resource kind (SpirvBindingDesc::metal_kind) */

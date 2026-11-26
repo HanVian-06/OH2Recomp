@@ -166,8 +166,9 @@ struct CGRect64 {
  * Guarantees 0 collision with OH2 subclass ivars (e.g. FIOSView, IOSAppDelegate).
  */
 #define OH2_OBJC_HEAP_MAGIC       0x4F48324FU /* 'OH2O' */
-#define OH2_OBJC_FLAG_IMMORTAL    1ULL
-#define OH2_OBJC_FLAG_RECLAIMABLE 2ULL
+#define OH2_OBJC_FLAG_IMMORTAL     1ULL
+#define OH2_OBJC_FLAG_RECLAIMABLE  2ULL
+#define OH2_OBJC_FLAG_DEALLOCATING 4ULL
 
 struct alignas(16) DarwinObjCPrefix {
     uint32_t    magic;
@@ -1111,7 +1112,7 @@ static long darwin_sysconf(int darwin_name) {
             return (n > 0) ? n : 8L;
         }
         case 200: /* Darwin _SC_PHYS_PAGES */
-            return (long)((6ULL * 1024ULL * 1024ULL * 1024ULL) / 4096ULL);
+            return (long)((3ULL * 1024ULL * 1024ULL * 1024ULL) / 4096ULL);
         default: {
             long r = sysconf(darwin_name);
             return (r >= 0) ? r : 4096L;
@@ -1176,7 +1177,7 @@ static int darwin_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, co
         return write_u32(ncpu > 0 ? (uint32_t)ncpu : 8U);
     }
     if (strcmp(name, "hw.memsize") == 0 || strcmp(name, "hw.physmem") == 0) {
-        return write_u64(6ULL * 1024ULL * 1024ULL * 1024ULL);
+        return write_u64(3ULL * 1024ULL * 1024ULL * 1024ULL);
     }
     if (strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.model") == 0) {
         return write_str("iPhone12,1");
@@ -1970,11 +1971,11 @@ static const char *imp_nsstring_UTF8String(void *self, const char *sel) {
 }
 static void *imp_nsstring_string(DarwinObjCClass *cls, const char *sel) {
     (void)cls; (void)sel;
-    return create_darwin_cfstring("", 0);
+    return darwin_objc_autorelease(create_darwin_cfstring("", 0));
 }
 static void *imp_nsstring_stringWithUTF8String(DarwinObjCClass *cls, const char *sel, const char *cstr) {
     (void)cls; (void)sel;
-    return create_darwin_cfstring_cstr(cstr);
+    return darwin_objc_autorelease(create_darwin_cfstring_cstr(cstr));
 }
 static void *imp_nsstring_initWithUTF8String(void *self, const char *sel, const char *cstr) {
     (void)sel;
@@ -1995,12 +1996,12 @@ static void *imp_nsstring_initWithCString_enc(void *self, const char *sel, const
 }
 static void *imp_nsstring_stringWithCString_enc(DarwinObjCClass *cls, const char *sel, const char *cstr, uint64_t enc) {
     (void)cls; (void)sel; (void)enc;
-    return create_darwin_cfstring_cstr(cstr);
+    return darwin_objc_autorelease(create_darwin_cfstring_cstr(cstr));
 }
 static void *imp_nsstring_stringWithString(DarwinObjCClass *cls, const char *sel, void *other) {
     (void)cls; (void)sel;
     char scratch[512];
-    return create_darwin_cfstring_cstr(darwin_cfstring_utf8(other, scratch, sizeof(scratch)));
+    return darwin_objc_autorelease(create_darwin_cfstring_cstr(darwin_cfstring_utf8(other, scratch, sizeof(scratch))));
 }
 static void *imp_nsstring_initWithString(void *self, const char *sel, void *other) {
     char scratch[512];
@@ -2088,12 +2089,21 @@ extern "C" void *darwin_objc_stringWithFormat_impl(void *self, const char *sel, 
     const char *fmt = darwin_cfstring_utf8(ns_fmt, fmt_scratch, sizeof(fmt_scratch));
     char out_buf[2048];
     darwin_vsnprintf_objc(out_buf, sizeof(out_buf), fmt ? fmt : "", darwin_sp);
-    return create_darwin_cfstring_cstr(out_buf);
+    return darwin_objc_autorelease(create_darwin_cfstring_cstr(out_buf));
 }
 
 extern "C" void darwin_objc_appendFormat_impl(void *self, const char *sel, const void *ns_fmt, char *darwin_sp) {
-    void *formatted = darwin_objc_stringWithFormat_impl(self, sel, ns_fmt, darwin_sp);
-    imp_nsmutablestring_appendString(self, sel, formatted);
+    char fmt_scratch[512];
+    const char *fmt = darwin_cfstring_utf8(ns_fmt, fmt_scratch, sizeof(fmt_scratch));
+    char out_buf[2048];
+    darwin_vsnprintf_objc(out_buf, sizeof(out_buf), fmt ? fmt : "", darwin_sp);
+    DarwinCFString *s = (DarwinCFString *)self;
+    DarwinObjCPrefix *pfx = get_heap_prefix(s);
+    if (!pfx) return;
+    if (!pfx->cpp_str) pfx->cpp_str = new std::string();
+    *pfx->cpp_str += out_buf;
+    s->flags = 0x07c8U;
+    sync_mutable_cfstring(s);
 }
 
 namespace {
@@ -3532,17 +3542,54 @@ extern "C" void oh2_objc_release_object(void *obj) {
         return;
     }
     DarwinObjCPrefix *pfx = get_heap_prefix(obj);
-    if (!pfx || (pfx->obj_flags & OH2_OBJC_FLAG_IMMORTAL)) {
+    if (!pfx || (pfx->obj_flags & (OH2_OBJC_FLAG_IMMORTAL | OH2_OBJC_FLAG_DEALLOCATING))) {
         return;
     }
     int32_t rc = __atomic_sub_fetch(&pfx->refcount, 1, __ATOMIC_ACQ_REL);
-    if (rc == 0 && (pfx->custom_dealloc != nullptr || (pfx->obj_flags & OH2_OBJC_FLAG_RECLAIMABLE) != 0)) {
-        pfx->magic = 0;
+    if (rc == 0) {
+        pfx->obj_flags |= OH2_OBJC_FLAG_DEALLOCATING;
+        __atomic_store_n(&pfx->refcount, 1, __ATOMIC_RELAXED);
         void (*dealloc_fn)(void *) = pfx->custom_dealloc;
         pfx->custom_dealloc = nullptr;
         if (dealloc_fn) {
             dealloc_fn(obj);
+        } else {
+            static const char *s_dealloc_sel = nullptr;
+            static const char *s_cxx_destruct_sel = nullptr;
+            if (!s_dealloc_sel) s_dealloc_sel = oh2_objc_intern_selector("dealloc");
+            if (!s_cxx_destruct_sel) s_cxx_destruct_sel = oh2_objc_intern_selector(".cxx_destruct");
+            void *imp = darwin_objc_lookup_imp(obj, s_dealloc_sel);
+            if (imp && imp != (void *)&imp_nsobject_dealloc && imp != (void *)&darwin_objc_fallback_imp) {
+                typedef void (*dealloc_imp_t)(void *, const char *);
+                ((dealloc_imp_t)imp)(obj, s_dealloc_sel);
+            }
+            /* Run ARC/C++ .cxx_destruct up the class hierarchy (releases strong ivars like NSCondition) */
+            uintptr_t raw_isa = *(uintptr_t *)obj;
+            if ((raw_isa & 1ULL) != 0) raw_isa &= 0x0000000ffffffff8ULL;
+            const DarwinObjCClass *cur = (const DarwinObjCClass *)raw_isa;
+            int depth = 0;
+            while (cur && is_valid_class_ptr(cur) && depth++ < 32) {
+                void *d_imp = nullptr;
+                auto it_c = g_method_table.find(cur);
+                if (it_c != g_method_table.end()) {
+                    auto it_m = it_c->second.find(s_cxx_destruct_sel);
+                    if (it_m != it_c->second.end()) d_imp = it_m->second;
+                }
+                if (!d_imp) {
+                    auto it_cs = g_method_table_str.find(cur);
+                    if (it_cs != g_method_table_str.end()) {
+                        auto it_ms = it_cs->second.find(s_cxx_destruct_sel);
+                        if (it_ms != it_cs->second.end()) d_imp = it_ms->second;
+                    }
+                }
+                if (d_imp) {
+                    typedef void (*destruct_imp_t)(void *, const char *);
+                    ((destruct_imp_t)d_imp)(obj, s_cxx_destruct_sel);
+                }
+                cur = cur->superclass;
+            }
         }
+        pfx->magic = 0;
         delete pfx->cpp_str;
         delete pfx->cpp_array;
         delete pfx->cpp_dict;

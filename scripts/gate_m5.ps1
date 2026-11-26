@@ -2,6 +2,7 @@ param(
     [string]$Serial = "RRCY40086KE",
     [switch]$SkipBuild,
     [switch]$BuildOnly,
+    [switch]$Release,
     [string]$BuildType = "RelWithDebInfo",
     [string]$Test = "",
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -26,10 +27,18 @@ $Adb           = Join-Path $env:ANDROID_HOME "platform-tools\adb.exe"
 $PkgName       = "com.oceanhorn2.port"
 $ActivityName  = "$PkgName/android.app.NativeActivity"
 
+if ($Release -and $BuildType -eq "RelWithDebInfo") {
+    $BuildType = "Release"
+}
 $BuildDir      = Join-Path $RepoRoot "build\m5"
-$CmakeBuildDir = Join-Path $BuildDir "cmake"
+if ($Release) {
+    $CmakeBuildDir = Join-Path $BuildDir "cmake_release"
+    $FinalApk      = Join-Path $BuildDir "oh2_android-release.apk"
+} else {
+    $CmakeBuildDir = Join-Path $BuildDir "cmake"
+    $FinalApk      = Join-Path $BuildDir "oh2_android-debug.apk"
+}
 $AppSrcDir     = Join-Path $RepoRoot "android\app"
-$FinalApk      = Join-Path $BuildDir "oh2_android-debug.apk"
 $LogcatPath    = Join-Path $BuildDir "m5_logcat.txt"
 
 $PayloadOh2    = Join-Path $RepoRoot "Payload\OH2.app\OH2"
@@ -56,8 +65,10 @@ New-Item -ItemType Directory -Force -Path $CmakeBuildDir | Out-Null
 # ============================================================================
 $NeedBuild = (-not $SkipBuild) -and (([string]::IsNullOrEmpty($Test)) -or (-not (Test-Path $FinalApk)))
 if ($NeedBuild) {
-    if (-not (Test-Path $PayloadOh2)) { Fail-Gate "Missing read-only Payload/OH2.app/OH2" }
-    if (-not (Test-Path $LibValSo))   { Fail-Gate "Missing $LibValSo" }
+    if (-not $Release) {
+        if (-not (Test-Path $PayloadOh2)) { Fail-Gate "Missing read-only Payload/OH2.app/OH2 (use -Release for asset-free open-source APK)" }
+        if (-not (Test-Path $LibValSo))   { Fail-Gate "Missing $LibValSo" }
+    }
 
     $CmakeExe  = Join-Path $env:ANDROID_HOME "cmake\3.22.1\bin\cmake.exe"
     $NinjaExe  = Join-Path $env:ANDROID_HOME "cmake\3.22.1\bin\ninja.exe"
@@ -83,8 +94,22 @@ if ($NeedBuild) {
     $AppSo = Join-Path $CmakeBuildDir "liboh2_android.so"
     if (-not (Test-Path $AppSo)) { Fail-Gate "Missing $AppSo" }
 
+    if ($Release) {
+        $LlvmStrip = Join-Path $env:ANDROID_NDK_HOME "toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-strip.exe"
+        $StrippedSo = Join-Path $CmakeBuildDir "liboh2_android.stripped.so"
+        if (Test-Path $LlvmStrip) {
+            Copy-Item -Force $AppSo $StrippedSo
+            & $LlvmStrip --strip-unneeded $StrippedSo
+            if ($LASTEXITCODE -eq 0) {
+                $AppSo = $StrippedSo
+                Write-Host "[M5 Build] Stripped Release liboh2_android.so ($([Math]::Round((Get-Item $AppSo).Length / 1MB, 2)) MB)"
+            }
+        }
+    }
+
     $BuildToolsDir = Join-Path $env:ANDROID_HOME "build-tools\36.0.0"
     $Aapt2     = Join-Path $BuildToolsDir "aapt2.exe"
+    $D8        = Join-Path $BuildToolsDir "d8.bat"
     $ZipAlign  = Join-Path $BuildToolsDir "zipalign.exe"
     $ApkSigner = Join-Path $BuildToolsDir "apksigner.bat"
 
@@ -93,6 +118,26 @@ if ($NeedBuild) {
         $PlatformJar = Join-Path $env:ANDROID_HOME "platforms\android-37.0\android.jar"
     }
     if (-not (Test-Path $PlatformJar)) { Fail-Gate "android.jar not found" }
+
+    # Compile Java Launcher sources -> classes.dex
+    $JavaSrcDir = Join-Path $AppSrcDir "java"
+    $ClassesDir = Join-Path $BuildDir "java_classes"
+    $DexDir     = Join-Path $BuildDir "dex"
+    Remove-Item -Recurse -Force $ClassesDir, $DexDir -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $ClassesDir, $DexDir | Out-Null
+    $JavaFiles = Get-ChildItem -Path $JavaSrcDir -Recurse -Filter "*.java" | ForEach-Object { $_.FullName }
+    if ($JavaFiles.Count -eq 0) { Fail-Gate "No Java sources found in $JavaSrcDir" }
+
+    Write-Host "[M5 Build] Compiling $($JavaFiles.Count) Java Launcher sources..."
+    & javac --release 11 -cp $PlatformJar -d $ClassesDir @JavaFiles
+    if ($LASTEXITCODE -ne 0) { Fail-Gate "javac failed" }
+
+    $ClassFiles = Get-ChildItem -Path $ClassesDir -Recurse -Filter "*.class" | ForEach-Object { $_.FullName }
+    Write-Host "[M5 Build] Converting $($ClassFiles.Count) .class files to classes.dex..."
+    & $D8 --min-api 29 --lib $PlatformJar --output $DexDir @ClassFiles
+    if ($LASTEXITCODE -ne 0) { Fail-Gate "d8 failed" }
+    $ClassesDex = Join-Path $DexDir "classes.dex"
+    if (-not (Test-Path $ClassesDex)) { Fail-Gate "Missing $ClassesDex" }
 
     $PrepareIcons = Join-Path $RepoRoot "scripts\m5\prepare_icons.py"
     $ResDir       = Join-Path $BuildDir "res"
@@ -112,12 +157,17 @@ if ($NeedBuild) {
     & $Aapt2 link -o $BaseApk --manifest $ManifestPath -R $ResZip -I $PlatformJar --min-sdk-version 29 --target-sdk-version 36
     if ($LASTEXITCODE -ne 0) { Fail-Gate "aapt2 link failed" }
 
-    python (Join-Path $RepoRoot "scripts\m5\pack_apk.py") `
-        --base-apk $BaseApk `
-        --out-apk  $AlignedApk `
-        --app-so   $AppSo `
-        --val-so   $LibValSo `
-        --macho    $PayloadOh2
+    $PackArgs = @(
+        (Join-Path $RepoRoot "scripts\m5\pack_apk.py"),
+        "--base-apk", $BaseApk,
+        "--out-apk",  $AlignedApk,
+        "--app-so",   $AppSo,
+        "--dex",      $ClassesDex
+    )
+    if (-not $Release) {
+        $PackArgs += @("--val-so", $LibValSo, "--macho", $PayloadOh2)
+    }
+    python @PackArgs
     if ($LASTEXITCODE -ne 0) { Fail-Gate "pack_apk.py failed" }
 
     & $ZipAlign -c -P 16 4 $AlignedApk

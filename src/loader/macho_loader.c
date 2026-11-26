@@ -408,6 +408,45 @@ int macho_load_at_offset(const char *path, off_t base_file_offset, size_t image_
                            MAP_PRIVATE | MAP_FIXED,
                            fd,
                            base_file_offset + (off_t)seg->fileoff);
+            if (m == MAP_FAILED && (prot & PROT_EXEC)) {
+                /*
+                 * External storage (/storage/emulated/0/Android/data/...) is mounted noexec,
+                 * and Android 10+ SELinux blocks file-backed PROT_EXEC from app writable dirs.
+                 * Fall back to anonymous RW mapping + pread + ARM64 icache flush + mprotect(RX).
+                 */
+                size_t page_sz = (size_t)sysconf(_SC_PAGESIZE);
+                size_t map_len = ((size_t)seg->filesize + page_sz - 1) & ~(page_sz - 1);
+                m = mmap(seg_target,
+                         map_len,
+                         PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                         -1,
+                         0);
+                if (m != MAP_FAILED) {
+                    size_t done = 0;
+                    off_t src_off = base_file_offset + (off_t)seg->fileoff;
+                    while (done < (size_t)seg->filesize) {
+                        ssize_t r = pread(fd, (uint8_t *)m + done, (size_t)seg->filesize - done, src_off + (off_t)done);
+                        if (r <= 0) {
+                            if (r < 0 && errno == EINTR) continue;
+                            m = MAP_FAILED;
+                            break;
+                        }
+                        done += (size_t)r;
+                    }
+                    if (m != MAP_FAILED) {
+                        __builtin___clear_cache((char *)m, (char *)m + seg->filesize);
+                        if (mprotect(m, map_len, prot) != 0) {
+                            oh2_log_error("mprotect(prot=%d) failed for anonymous fallback %s: %s",
+                                          prot, seg->segname, strerror(errno));
+                            m = MAP_FAILED;
+                        } else {
+                            oh2_log_info("Loaded executable segment %s via anonymous pread+mprotect fallback (%zu bytes)",
+                                         seg->segname, (size_t)seg->filesize);
+                        }
+                    }
+                }
+            }
             if (m == MAP_FAILED) {
                 oh2_log_error("Failed mapping segment %s at %p (filesize=0x%llx fileoff=0x%llx baseoff=0x%llx): %s",
                               seg->segname, seg_target,

@@ -39,8 +39,11 @@ struct DisplayLinkState {
     void            *self_obj{nullptr};
     double           timestamp{0.0};
     double           target_timestamp{0.0};
+    double           next_fire_ts{0.0};
     pthread_t        thread{0};
 };
+
+static std::atomic<int> g_cadl_target_fps{30};
 
 namespace {
 
@@ -99,6 +102,7 @@ static void *ensure_view_layer(void *self) {
     if (!layer) {
         layer = oh2_objc_alloc_instance(oh2_objc_get_class("CAMetalLayer"), 128);
     }
+    if (layer) oh2_objc_mark_immortal(layer);
     std::lock_guard<std::mutex> lk(g_ui_mutex);
     UIObjAssoc &a = g_ui_assoc[self];
     if (!a.layer) a.layer = layer;
@@ -111,6 +115,7 @@ static void *m2_uiapp_sharedApplication(void *cls, const char *sel) {
     std::lock_guard<std::mutex> lk(g_ui_mutex);
     if (!g_ui_application) {
         g_ui_application = oh2_objc_alloc_instance(oh2_objc_get_class("UIApplication"), 64);
+        oh2_objc_mark_immortal(g_ui_application);
     }
     return g_ui_application;
 }
@@ -387,6 +392,7 @@ static void *m2_uiscreen_mainScreen(void *cls, const char *sel) {
     std::lock_guard<std::mutex> lk(g_ui_mutex);
     if (!g_ui_screen) {
         g_ui_screen = oh2_objc_alloc_instance(oh2_objc_get_class("UIScreen"), 64);
+        oh2_objc_mark_immortal(g_ui_screen);
     }
     double sc = (g_screen_scale > 0.0) ? g_screen_scale : 2.0;
     g_ui_assoc[g_ui_screen].frame = {
@@ -422,6 +428,7 @@ static void *m2_uiscreen_traitCollection(void *self, const char *sel) {
     std::lock_guard<std::mutex> lk(g_ui_mutex);
     if (!g_trait_collection) {
         g_trait_collection = oh2_objc_alloc_instance(oh2_objc_get_class("UITraitCollection"), 64);
+        oh2_objc_mark_immortal(g_trait_collection);
     }
     return g_trait_collection;
 }
@@ -436,6 +443,7 @@ static void *m2_uidevice_currentDevice(void *cls, const char *sel) {
     std::lock_guard<std::mutex> lk(g_ui_mutex);
     if (!g_ui_device) {
         g_ui_device = oh2_objc_alloc_instance(oh2_objc_get_class("UIDevice"), 64);
+        oh2_objc_mark_immortal(g_ui_device);
     }
     return g_ui_device;
 }
@@ -537,8 +545,28 @@ static void m2_cadl_addToRunLoop(void *self, const char *sel, void *runloop, voi
 
 static void m2_cadl_setPreferredFPS(void *self, const char *sel, int64_t fps) {
     (void)sel;
+    int eff = (fps > 0 && fps <= 120) ? (int)fps : 60;
     DisplayLinkState *st = get_dl_state(self);
-    if (st) st->preferred_fps.store(fps > 0 ? (int)fps : 60);
+    if (st) {
+        st->preferred_fps.store(eff);
+        st->next_fire_ts = 0.0;
+    }
+    g_cadl_target_fps.store(eff, std::memory_order_release);
+    oh2_log_info("[M5] CADisplayLink setPreferredFramesPerSecond:%lld (eff=%d)", (long long)fps, eff);
+}
+
+static void m2_cadl_setFrameInterval(void *self, const char *sel, int64_t interval) {
+    (void)sel;
+    int eff = (interval >= 2) ? (int)(60 / interval) : 60;
+    if (eff < 15) eff = 15;
+    m2_cadl_setPreferredFPS(self, sel, eff);
+}
+
+static int64_t m2_cadl_frameInterval(void *self, const char *sel) {
+    (void)sel;
+    DisplayLinkState *st = get_dl_state(self);
+    int fps = st ? st->preferred_fps.load() : 60;
+    return (fps <= 30) ? 2 : 1;
 }
 
 static void m2_cadl_setPaused(void *self, const char *sel, uint8_t paused) {
@@ -606,7 +634,10 @@ static void *m2_uifont_fontName(void *s, const char *sel) { (void)s; (void)sel; 
 static void *g_ui_pasteboard = nullptr;
 static void *m2_uipb_general(void *c, const char *sel) {
     (void)sel;
-    if (!g_ui_pasteboard) g_ui_pasteboard = oh2_objc_alloc_instance(c, 64);
+    if (!g_ui_pasteboard) {
+        g_ui_pasteboard = oh2_objc_alloc_instance(c, 64);
+        oh2_objc_mark_immortal(g_ui_pasteboard);
+    }
     return g_ui_pasteboard;
 }
 static void *m2_ui_initWithStyle(void *s, const char *sel, int64_t style) { (void)sel; (void)style; return s; }
@@ -754,7 +785,12 @@ void oh2_cadisplaylink_set_vsync_driven(int enable) {
     g_vsync_driven.store(enable ? 1 : 0);
 }
 
+int oh2_cadisplaylink_get_target_fps(void) {
+    return g_cadl_target_fps.load(std::memory_order_acquire);
+}
+
 void oh2_cadisplaylink_tick_all(double timestamp_sec, double target_timestamp_sec) {
+    (void)target_timestamp_sec;
     std::vector<DisplayLinkState *> links;
     {
         std::lock_guard<std::mutex> lk(g_dl_mutex);
@@ -765,10 +801,21 @@ void oh2_cadisplaylink_tick_all(double timestamp_sec, double target_timestamp_se
         if (!st || !st->running.load() || st->paused.load() || !st->target || !st->selector) {
             continue;
         }
+        int fps = st->preferred_fps.load();
+        if (fps <= 0) fps = 60;
+        double period = 1.0 / (double)fps;
+        /* Crystal-locked hardware VSync divider:
+           - 30 FPS (min_dt = 28.5ms): fires every 2nd VSync on 60Hz (33.33ms), 3rd on 90Hz (33.33ms),
+             and 4th on 120Hz (33.33ms) with 3.5-11.8ms jitter margin and ZERO cumulative drift!
+           - 60 FPS (min_dt = 13.5ms): fires every 1st VSync on 60Hz (16.67ms) and 2nd on 120Hz (16.67ms)! */
+        const double min_dt = (fps <= 30) ? 0.0285 : ((fps <= 45) ? 0.0195 : 0.0135);
+        if (st->next_fire_ts > 0.0 && timestamp_sec >= st->next_fire_ts &&
+            (timestamp_sec - st->next_fire_ts) < min_dt) {
+            continue;
+        }
+        st->next_fire_ts = timestamp_sec;
         st->timestamp = timestamp_sec;
-        st->target_timestamp = (target_timestamp_sec > timestamp_sec)
-                                   ? target_timestamp_sec
-                                   : (timestamp_sec + (1.0 / (double)(st->preferred_fps.load() > 0 ? st->preferred_fps.load() : 60)));
+        st->target_timestamp = timestamp_sec + period;
         ((msg_fn_t)oh2_objc_msgSend)(st->target, st->selector, st->self_obj);
     }
 }
@@ -894,6 +941,8 @@ void oh2_m2_register_ui_bridges(void) {
     oh2_objc_register_instance_method("CADisplayLink", "addToRunLoop:forMode:",          (void *)&m2_cadl_addToRunLoop);
     oh2_objc_register_instance_method("CADisplayLink", "preferredFramesPerSecond",       (void *)&m2_cadl_preferredFPS);
     oh2_objc_register_instance_method("CADisplayLink", "setPreferredFramesPerSecond:",    (void *)&m2_cadl_setPreferredFPS);
+    oh2_objc_register_instance_method("CADisplayLink", "frameInterval",                  (void *)&m2_cadl_frameInterval);
+    oh2_objc_register_instance_method("CADisplayLink", "setFrameInterval:",               (void *)&m2_cadl_setFrameInterval);
     oh2_objc_register_instance_method("CADisplayLink", "setPaused:",                      (void *)&m2_cadl_setPaused);
     oh2_objc_register_instance_method("CADisplayLink", "invalidate",                      (void *)&m2_cadl_invalidate);
     oh2_objc_register_instance_method("CADisplayLink", "timestamp",                       (void *)&m2_cadl_timestamp);

@@ -44,6 +44,7 @@ static void *gk_localPlayer(void *cls, const char *sel) {
     (void)cls; (void)sel;
     if (!g_gk_local_player) {
         g_gk_local_player = oh2_objc_alloc_instance(oh2_objc_get_class("GKLocalPlayer"), 64);
+        oh2_objc_mark_immortal(g_gk_local_player);
     }
     return g_gk_local_player;
 }
@@ -78,6 +79,7 @@ static void *sk_defaultQueue(void *cls, const char *sel) {
     (void)cls; (void)sel;
     if (!g_sk_payment_queue) {
         g_sk_payment_queue = oh2_objc_alloc_instance(oh2_objc_get_class("SKPaymentQueue"), 64);
+        oh2_objc_mark_immortal(g_sk_payment_queue);
     }
     return g_sk_payment_queue;
 }
@@ -92,6 +94,7 @@ static void *ck_defaultContainer(void *cls, const char *sel) {
     (void)cls; (void)sel;
     if (!g_ck_container) {
         g_ck_container = oh2_objc_alloc_instance(oh2_objc_get_class("CKContainer"), 64);
+        oh2_objc_mark_immortal(g_ck_container);
     }
     return g_ck_container;
 }
@@ -100,6 +103,7 @@ static void *ck_database(void *self, const char *sel) {
     (void)self; (void)sel;
     if (!g_ck_database) {
         g_ck_database = oh2_objc_alloc_instance(oh2_objc_get_class("CKDatabase"), 64);
+        oh2_objc_mark_immortal(g_ck_database);
     }
     return g_ck_database;
 }
@@ -136,6 +140,7 @@ static void *un_currentCenter(void *cls, const char *sel) {
     (void)cls; (void)sel;
     if (!g_un_center) {
         g_un_center = oh2_objc_alloc_instance(oh2_objc_get_class("UNUserNotificationCenter"), 64);
+        oh2_objc_mark_immortal(g_un_center);
     }
     return g_un_center;
 }
@@ -153,6 +158,7 @@ static void *dc_currentDevice(void *cls, const char *sel) {
     (void)cls; (void)sel;
     if (!g_dc_device) {
         g_dc_device = oh2_objc_alloc_instance(oh2_objc_get_class("DCDevice"), 64);
+        oh2_objc_mark_immortal(g_dc_device);
     }
     return g_dc_device;
 }
@@ -181,6 +187,7 @@ static void *plcrash_sharedReporter(void *cls, const char *sel) {
     (void)sel;
     if (!g_plcrash_reporter) {
         g_plcrash_reporter = oh2_objc_alloc_instance(cls, 128);
+        oh2_objc_mark_immortal(g_plcrash_reporter);
     }
     return g_plcrash_reporter;
 }

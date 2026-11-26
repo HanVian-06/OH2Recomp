@@ -66,26 +66,36 @@ VkFormat mtl_pixel_format_to_vk(uint64_t mtl_fmt, bool *out_is_astc, bool *out_i
         case 124: vk = VK_FORMAT_R32G32B32A32_SINT; break;
         case 125: vk = VK_FORMAT_R32G32B32A32_SFLOAT; break;
 
-        /* Native iOS ASTC formats mapped directly (zero RGBA8 CPU decompression!) */
-        case 186: vk = VK_FORMAT_ASTC_4x4_SRGB_BLOCK; astc = true; break;
-        case 188: vk = VK_FORMAT_ASTC_5x5_SRGB_BLOCK; astc = true; break;
-        case 190: vk = VK_FORMAT_ASTC_6x6_SRGB_BLOCK; astc = true; break;
-        case 192: vk = VK_FORMAT_ASTC_8x8_SRGB_BLOCK; astc = true; break;
-        case 194: vk = VK_FORMAT_ASTC_8x8_SRGB_BLOCK; astc = true; break;
-        case 195: vk = VK_FORMAT_ASTC_10x8_SRGB_BLOCK; astc = true; break;
-        case 196: vk = VK_FORMAT_ASTC_10x10_SRGB_BLOCK; astc = true; break;
-        case 197: vk = VK_FORMAT_ASTC_12x10_SRGB_BLOCK; astc = true; break;
-        case 198: vk = VK_FORMAT_ASTC_12x12_SRGB_BLOCK; astc = true; break;
+        /* Native iOS ASTC formats mapped directly to exact Apple MTLPixelFormat enum values */
+        case 186: vk = VK_FORMAT_ASTC_4x4_SRGB_BLOCK;   astc = true; break;
+        case 187: vk = VK_FORMAT_ASTC_5x4_SRGB_BLOCK;   astc = true; break;
+        case 188: vk = VK_FORMAT_ASTC_5x5_SRGB_BLOCK;   astc = true; break;
+        case 189: vk = VK_FORMAT_ASTC_6x5_SRGB_BLOCK;   astc = true; break;
+        case 190: vk = VK_FORMAT_ASTC_6x6_SRGB_BLOCK;   astc = true; break;
+        case 192: vk = VK_FORMAT_ASTC_8x5_SRGB_BLOCK;   astc = true; break;
+        case 193: vk = VK_FORMAT_ASTC_8x6_SRGB_BLOCK;   astc = true; break;
+        case 194: vk = VK_FORMAT_ASTC_8x8_SRGB_BLOCK;   astc = true; break;
+        case 195: vk = VK_FORMAT_ASTC_10x5_SRGB_BLOCK;  astc = true; break;
+        case 196: vk = VK_FORMAT_ASTC_10x6_SRGB_BLOCK;  astc = true; break;
+        case 197: vk = VK_FORMAT_ASTC_10x8_SRGB_BLOCK;  astc = true; break;
+        case 198: vk = VK_FORMAT_ASTC_10x10_SRGB_BLOCK; astc = true; break;
+        case 199: vk = VK_FORMAT_ASTC_12x10_SRGB_BLOCK; astc = true; break;
+        case 200: vk = VK_FORMAT_ASTC_12x12_SRGB_BLOCK; astc = true; break;
 
-        case 204: vk = VK_FORMAT_ASTC_4x4_UNORM_BLOCK; astc = true; break;
-        case 206: vk = VK_FORMAT_ASTC_5x5_UNORM_BLOCK; astc = true; break;
-        case 208: vk = VK_FORMAT_ASTC_6x6_UNORM_BLOCK; astc = true; break;
-        case 210: vk = VK_FORMAT_ASTC_8x8_UNORM_BLOCK; astc = true; break;
-        case 212: vk = VK_FORMAT_ASTC_8x8_UNORM_BLOCK; astc = true; break;
-        case 213: vk = VK_FORMAT_ASTC_10x8_UNORM_BLOCK; astc = true; break;
-        case 214: vk = VK_FORMAT_ASTC_10x10_UNORM_BLOCK; astc = true; break;
-        case 215: vk = VK_FORMAT_ASTC_12x10_UNORM_BLOCK; astc = true; break;
-        case 216: vk = VK_FORMAT_ASTC_12x12_UNORM_BLOCK; astc = true; break;
+        case 204: vk = VK_FORMAT_ASTC_4x4_UNORM_BLOCK;   astc = true; break;
+        case 205: vk = VK_FORMAT_ASTC_5x4_UNORM_BLOCK;   astc = true; break;
+        case 206: vk = VK_FORMAT_ASTC_5x5_UNORM_BLOCK;   astc = true; break;
+        case 207: vk = VK_FORMAT_ASTC_6x5_UNORM_BLOCK;   astc = true; break;
+        case 208: vk = VK_FORMAT_ASTC_6x6_UNORM_BLOCK;   astc = true; break;
+        case 210: vk = VK_FORMAT_ASTC_8x5_UNORM_BLOCK;   astc = true; break;
+        case 211: vk = VK_FORMAT_ASTC_8x6_UNORM_BLOCK;   astc = true; break;
+        case 212: vk = VK_FORMAT_ASTC_8x8_UNORM_BLOCK;   astc = true; break;
+        case 213: vk = VK_FORMAT_ASTC_10x5_UNORM_BLOCK;  astc = true; break;
+        case 214: vk = VK_FORMAT_ASTC_10x6_UNORM_BLOCK;  astc = true; break;
+        case 215: vk = VK_FORMAT_ASTC_10x8_UNORM_BLOCK;  astc = true; break;
+        case 216: vk = VK_FORMAT_ASTC_10x10_UNORM_BLOCK; astc = true; break;
+        case 217: vk = VK_FORMAT_ASTC_12x10_UNORM_BLOCK; astc = true; break;
+        case 218: vk = VK_FORMAT_ASTC_12x12_UNORM_BLOCK; astc = true; break;
 
         /* Depth / Stencil */
         case 250: vk = VK_FORMAT_D16_UNORM; depth = true; break;
@@ -146,15 +156,33 @@ uint32_t mtl_pixel_format_block_size(VkFormat fmt, uint32_t *out_bw, uint32_t *o
         case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
         case VK_FORMAT_ASTC_4x4_SRGB_BLOCK:
             bw = 4; bh = 4; bsz = 16; break;
+        case VK_FORMAT_ASTC_5x4_UNORM_BLOCK:
+        case VK_FORMAT_ASTC_5x4_SRGB_BLOCK:
+            bw = 5; bh = 4; bsz = 16; break;
         case VK_FORMAT_ASTC_5x5_UNORM_BLOCK:
         case VK_FORMAT_ASTC_5x5_SRGB_BLOCK:
             bw = 5; bh = 5; bsz = 16; break;
+        case VK_FORMAT_ASTC_6x5_UNORM_BLOCK:
+        case VK_FORMAT_ASTC_6x5_SRGB_BLOCK:
+            bw = 6; bh = 5; bsz = 16; break;
         case VK_FORMAT_ASTC_6x6_UNORM_BLOCK:
         case VK_FORMAT_ASTC_6x6_SRGB_BLOCK:
             bw = 6; bh = 6; bsz = 16; break;
+        case VK_FORMAT_ASTC_8x5_UNORM_BLOCK:
+        case VK_FORMAT_ASTC_8x5_SRGB_BLOCK:
+            bw = 8; bh = 5; bsz = 16; break;
+        case VK_FORMAT_ASTC_8x6_UNORM_BLOCK:
+        case VK_FORMAT_ASTC_8x6_SRGB_BLOCK:
+            bw = 8; bh = 6; bsz = 16; break;
         case VK_FORMAT_ASTC_8x8_UNORM_BLOCK:
         case VK_FORMAT_ASTC_8x8_SRGB_BLOCK:
             bw = 8; bh = 8; bsz = 16; break;
+        case VK_FORMAT_ASTC_10x5_UNORM_BLOCK:
+        case VK_FORMAT_ASTC_10x5_SRGB_BLOCK:
+            bw = 10; bh = 5; bsz = 16; break;
+        case VK_FORMAT_ASTC_10x6_UNORM_BLOCK:
+        case VK_FORMAT_ASTC_10x6_SRGB_BLOCK:
+            bw = 10; bh = 6; bsz = 16; break;
         case VK_FORMAT_ASTC_10x8_UNORM_BLOCK:
         case VK_FORMAT_ASTC_10x8_SRGB_BLOCK:
             bw = 10; bh = 8; bsz = 16; break;
@@ -195,12 +223,24 @@ static std::atomic<uint64_t> g_drawable_id_counter{1};
 /* ============================================================================
  * MTLBuffer
  * ============================================================================ */
+static int get_buffer_pool_bucket(uint64_t sz, uint64_t *out_cap) {
+    static constexpr uint64_t kBuckets[5] = {4096ULL, 16384ULL, 65536ULL, 262144ULL, 1048576ULL};
+    for (int i = 0; i < 5; ++i) {
+        if (sz <= kBuckets[i]) {
+            if (out_cap) *out_cap = kBuckets[i];
+            return i;
+        }
+    }
+    if (out_cap) *out_cap = sz;
+    return -1;
+}
+
 static void mtl_buffer_dealloc(void *self) {
     auto *impl = unwrap_mtl<MtlBufferImpl>(self);
     if (!impl) return;
     MtlVkState &st = get_state();
-    const uint64_t alloc_sz = std::max<uint64_t>(impl->length, 16);
-    enqueue_deferred_buffer(impl->buffer, impl->allocation);
+    const uint64_t alloc_sz = (impl->alloc_capacity > 0) ? impl->alloc_capacity : std::max<uint64_t>(impl->length, 16);
+    enqueue_deferred_buffer(impl->buffer, impl->allocation, impl->mapped, impl->alloc_capacity);
     st.live_buffers.fetch_sub(1, std::memory_order_relaxed);
     st.live_buffer_bytes.fetch_sub(static_cast<int64_t>(alloc_sz), std::memory_order_relaxed);
     delete impl;
@@ -212,6 +252,30 @@ static void *mtl_device_newBufferWithLength(void *self, const char *sel, uint64_
     if (!st.initialized) return nullptr;
 
     uint64_t alloc_sz = std::max<uint64_t>(length, 16);
+    uint64_t bucket_cap = alloc_sz;
+    int bucket_idx = get_buffer_pool_bucket(alloc_sz, &bucket_cap);
+    if (bucket_idx >= 0) {
+        alloc_sz = bucket_cap;
+        std::lock_guard<std::mutex> lk(st.mutex);
+        auto &pool = st.buffer_pool[bucket_idx];
+        if (!pool.empty()) {
+            auto pb = pool.back();
+            pool.pop_back();
+            auto *impl = new MtlBufferImpl();
+            impl->buffer = pb.buffer;
+            impl->allocation = pb.allocation;
+            impl->length = length;
+            impl->alloc_capacity = pb.capacity;
+            impl->unique_id = next_mtl_resource_uid();
+            impl->options = options;
+            impl->mapped = pb.mapped;
+            impl->host_coherent = true;
+            st.live_buffers.fetch_add(1, std::memory_order_relaxed);
+            st.live_buffer_bytes.fetch_add(static_cast<int64_t>(pb.capacity), std::memory_order_relaxed);
+            return alloc_mtl_wrap_managed("MTLBuffer", impl, &mtl_buffer_dealloc, false);
+        }
+    }
+
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = alloc_sz;
     bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
@@ -225,7 +289,6 @@ static void *mtl_device_newBufferWithLength(void *self, const char *sel, uint64_
 
     VmaAllocationCreateInfo vai{};
     vai.usage = VMA_MEMORY_USAGE_AUTO;
-    /* Keep host mapping randomly accessible (read + write) so readback & dynamic uploads are cache-safe */
     vai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
 
     VkBuffer buf = VK_NULL_HANDLE;
@@ -240,6 +303,8 @@ static void *mtl_device_newBufferWithLength(void *self, const char *sel, uint64_
     impl->buffer = buf;
     impl->allocation = valloc;
     impl->length = length;
+    impl->alloc_capacity = (bucket_idx >= 0) ? alloc_sz : 0;
+    impl->unique_id = next_mtl_resource_uid();
     impl->options = options;
     impl->mapped = vinfo.pMappedData;
     impl->host_coherent = true;
@@ -349,6 +414,14 @@ static void mtl_tex_dealloc(void *self) {
     auto *tex = unwrap_mtl<MtlTextureImpl>(self);
     if (!tex || tex->is_swapchain) return;
     MtlVkState &st = get_state();
+    if (tex->ds_att_view != VK_NULL_HANDLE) {
+        enqueue_deferred_view(tex->ds_att_view);
+        tex->ds_att_view = VK_NULL_HANDLE;
+    }
+    for (const auto &sv : tex->subres_att_views) {
+        if (sv.view != VK_NULL_HANDLE) enqueue_deferred_view(sv.view);
+    }
+    tex->subres_att_views.clear();
     if (tex->owns_image) {
         enqueue_deferred_image(tex->image, tex->allocation, tex->owns_view ? tex->view : VK_NULL_HANDLE);
         st.live_textures.fetch_sub(1, std::memory_order_relaxed);
@@ -360,6 +433,10 @@ static void mtl_tex_dealloc(void *self) {
         oh2_objc_release_object(tex->parent_tex_obj);
     }
     if (tex->retains_parent_buf && tex->parent_buffer_obj) {
+        for (uint32_t fi = 0; fi < kMaxFramesInFlight; ++fi) {
+            auto &pl = st.frames[fi].preamble_btex_list;
+            pl.erase(std::remove(pl.begin(), pl.end(), tex), pl.end());
+        }
         {
             std::lock_guard<std::mutex> blk(st.buf_tex_mutex);
             auto &ab = st.active_buf_textures;
@@ -546,6 +623,7 @@ static void *mtl_device_newTexture(void *self, const char *sel, void *desc_obj) 
     }
 
     auto *tex = new MtlTextureImpl();
+    tex->unique_id = next_mtl_resource_uid();
     tex->image = img;
     tex->allocation = alloc;
     tex->view = view;
@@ -559,7 +637,7 @@ static void *mtl_device_newTexture(void *self, const char *sel, void *desc_obj) 
     tex->array_layers = ici.arrayLayers;
     tex->sample_count = 1;
     tex->aspect_mask = aspect;
-    tex->mip_layouts.assign(ici.mipLevels, VK_IMAGE_LAYOUT_UNDEFINED);
+    tex->mip_layouts.assign(static_cast<size_t>(ici.mipLevels) * ici.arrayLayers, VK_IMAGE_LAYOUT_UNDEFINED);
     tex->owns_image = true;
     tex->owns_view = true;
     tex->cpu_cache_mode = d->cpu_cache_mode;
@@ -721,6 +799,7 @@ static void mtl_tex_replaceRegionSlice(void *self, const char *sel, MTLRegion *r
     uint32_t by = (h + bh - 1u) / bh;
     uint64_t packed_row = (uint64_t)bx * bsz;
     uint64_t row_bytes = (bytesPerRow > 0) ? bytesPerRow : packed_row;
+    uint64_t img_bytes = (d > 1 && bytesPerImage > 0) ? bytesPerImage : (row_bytes * by);
     uint64_t packed_total = packed_row * by * d;
     if (packed_total == 0) return;
 
@@ -732,13 +811,19 @@ static void mtl_tex_replaceRegionSlice(void *self, const char *sel, MTLRegion *r
         item.slice = (uint32_t)slice;
         item.reg = *region;
         item.bytes.resize(static_cast<size_t>(packed_total));
-        if (row_bytes == packed_row) {
+        if (row_bytes == packed_row && (d <= 1 || img_bytes == packed_row * by)) {
             std::memcpy(item.bytes.data(), bytes, static_cast<size_t>(packed_total));
         } else {
             const uint8_t *src = static_cast<const uint8_t *>(bytes);
             uint8_t *dst = item.bytes.data();
-            for (uint32_t row = 0; row < by * d; ++row) {
-                std::memcpy(dst + row * packed_row, src + row * row_bytes, static_cast<size_t>(packed_row));
+            for (uint32_t z = 0; z < d; ++z) {
+                const uint8_t *src_slice = src + (uint64_t)z * img_bytes;
+                uint8_t *dst_slice = dst + (uint64_t)z * (packed_row * by);
+                for (uint32_t row = 0; row < by; ++row) {
+                    std::memcpy(dst_slice + (uint64_t)row * packed_row,
+                                src_slice + (uint64_t)row * row_bytes,
+                                static_cast<size_t>(packed_row));
+                }
             }
         }
         oh2_objc_add_refcount(self, 1);
@@ -755,13 +840,19 @@ static void mtl_tex_replaceRegionSlice(void *self, const char *sel, MTLRegion *r
         MTLVK_LOGE("replaceRegion: staging allocate(%llu) failed", (unsigned long long)packed_total);
         return;
     }
-    if (row_bytes == packed_row) {
+    if (row_bytes == packed_row && (d <= 1 || img_bytes == packed_row * by)) {
         std::memcpy(staging.mapped, bytes, (size_t)packed_total);
     } else {
         const uint8_t *src = static_cast<const uint8_t *>(bytes);
         uint8_t *dst = static_cast<uint8_t *>(staging.mapped);
-        for (uint32_t row = 0; row < by * d; ++row) {
-            std::memcpy(dst + row * packed_row, src + row * row_bytes, (size_t)packed_row);
+        for (uint32_t z = 0; z < d; ++z) {
+            const uint8_t *src_slice = src + (uint64_t)z * img_bytes;
+            uint8_t *dst_slice = dst + (uint64_t)z * (packed_row * by);
+            for (uint32_t row = 0; row < by; ++row) {
+                std::memcpy(dst_slice + (uint64_t)row * packed_row,
+                            src_slice + (uint64_t)row * row_bytes,
+                            (size_t)packed_row);
+            }
         }
     }
     st.staging.flush(staging.offset, packed_total);
@@ -775,7 +866,7 @@ static void mtl_tex_replaceRegionSlice(void *self, const char *sel, MTLRegion *r
 
     execute_immediate_upload([](VkCommandBuffer cmd, void *ud) {
         auto *c = static_cast<CopyCtx *>(ud);
-        VkImageLayout old_l = c->tex->mip_layouts[c->level];
+        VkImageLayout old_l = c->tex->get_subres_layout(c->level, c->slice);
         transition_image_layout(cmd, c->tex->image, c->tex->aspect_mask,
                                 c->level, 1, c->slice, 1,
                                 old_l, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -797,7 +888,7 @@ static void mtl_tex_replaceRegionSlice(void *self, const char *sel, MTLRegion *r
         transition_image_layout(cmd, c->tex->image, c->tex->aspect_mask,
                                 c->level, 1, c->slice, 1,
                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        c->tex->mip_layouts[c->level] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        c->tex->set_subres_layout(c->level, c->slice, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }, &ctx);
 }
 
@@ -811,6 +902,9 @@ static void *mtl_tex_newViewFmt(void *self, const char *sel, uint64_t fmt) {
     auto *src = unwrap_mtl<MtlTextureImpl>(self);
     if (!src) return nullptr;
     auto *vtex = new MtlTextureImpl(*src);
+    vtex->unique_id = next_mtl_resource_uid();
+    vtex->ds_att_view = VK_NULL_HANDLE;
+    vtex->subres_att_views.clear();
     vtex->owns_image = false;
     vtex->is_swapchain = false;
     vtex->parent_tex_obj = self;
@@ -848,6 +942,9 @@ static void *mtl_tex_newViewRange(void *self, const char *sel, uint64_t fmt, uin
     auto *src = unwrap_mtl<MtlTextureImpl>(self);
     if (!src) return nullptr;
     auto *vtex = new MtlTextureImpl(*src);
+    vtex->unique_id = next_mtl_resource_uid();
+    vtex->ds_att_view = VK_NULL_HANDLE;
+    vtex->subres_att_views.clear();
     vtex->owns_image = false;
     vtex->is_swapchain = false;
     vtex->parent_tex_obj = self;
@@ -969,6 +1066,8 @@ static float mtl_sd_get_lmax(void *s, const char *sel) { (void)sel; auto *d = un
 static void mtl_sd_set_lmax(void *s, const char *sel, float v) { (void)sel; if (auto *d = unwrap_mtl<MtlSamplerDescriptorImpl>(s)) d->lod_max = v; }
 static uint64_t mtl_sd_get_cmp(void *s, const char *sel) { (void)sel; auto *d = unwrap_mtl<MtlSamplerDescriptorImpl>(s); return d ? d->compare_func : 0; }
 static void mtl_sd_set_cmp(void *s, const char *sel, uint64_t v) { (void)sel; if (auto *d = unwrap_mtl<MtlSamplerDescriptorImpl>(s)) d->compare_func = v; }
+static uint64_t mtl_sd_get_border(void *s, const char *sel) { (void)sel; auto *d = unwrap_mtl<MtlSamplerDescriptorImpl>(s); return d ? d->border_color : 0; }
+static void mtl_sd_set_border(void *s, const char *sel, uint64_t v) { (void)sel; if (auto *d = unwrap_mtl<MtlSamplerDescriptorImpl>(s)) d->border_color = v; }
 static uint8_t mtl_sd_get_norm(void *s, const char *sel) { (void)sel; auto *d = unwrap_mtl<MtlSamplerDescriptorImpl>(s); return d ? d->normalized_coords : 1; }
 static void mtl_sd_set_norm(void *s, const char *sel, uint8_t v) { (void)sel; if (auto *d = unwrap_mtl<MtlSamplerDescriptorImpl>(s)) d->normalized_coords = v; }
 static uint8_t mtl_sd_false(void *s, const char *sel) { (void)s; (void)sel; return 0; }
@@ -977,14 +1076,28 @@ static void *mtl_sd_label(void *s, const char *sel) { (void)s; (void)sel; return
 
 static VkSamplerAddressMode map_addr(uint64_t m) {
     switch (m) {
+        case 1: return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
         case 2: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
         case 3: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
-        case 4: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+        case 4: /* ClampToZero */
+        case 5: /* ClampToBorderColor */
+            return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
         default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     }
 }
 
-static VkCompareOp map_cmp_op(uint64_t c) {
+static VkBorderColor map_border_color(uint64_t s_addr, uint64_t t_addr, uint64_t r_addr, uint64_t border) {
+    if (s_addr == 4 || t_addr == 4 || r_addr == 4) {
+        return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    }
+    switch (border) {
+        case 1: return VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+        case 2: return VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+        default: return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    }
+}
+
+[[maybe_unused]] static VkCompareOp map_cmp_op(uint64_t c) {
     switch (c) {
         case 1: return VK_COMPARE_OP_LESS;
         case 2: return VK_COMPARE_OP_EQUAL;
@@ -1001,6 +1114,9 @@ static void mtl_sampler_dealloc(void *self) {
     auto *impl = unwrap_mtl<MtlSamplerImpl>(self);
     if (!impl) return;
     enqueue_deferred_sampler(impl->sampler);
+    if (impl->nearest_sampler != VK_NULL_HANDLE && impl->nearest_sampler != impl->sampler) {
+        enqueue_deferred_sampler(impl->nearest_sampler);
+    }
     delete impl;
 }
 
@@ -1019,20 +1135,43 @@ static void *mtl_device_newSampler(void *self, const char *sel, void *desc_obj) 
     sci.addressModeU = map_addr(d->s_addr);
     sci.addressModeV = map_addr(d->t_addr);
     sci.addressModeW = map_addr(d->r_addr);
+    sci.borderColor = map_border_color(d->s_addr, d->t_addr, d->r_addr, d->border_color);
     sci.maxLod = (d->mip_filter == 0) ? 0.0f : std::max(d->lod_max, 0.25f);
     sci.minLod = d->lod_min;
     if (d->max_anisotropy > 1 && st.vk_ctx.caps().supported_features.samplerAnisotropy) {
         sci.anisotropyEnable = VK_TRUE;
         sci.maxAnisotropy = std::min<float>((float)d->max_anisotropy, st.vk_ctx.caps().max_sampler_anisotropy);
     }
-    if (d->compare_func != 0) {
-        sci.compareEnable = VK_TRUE;
-        sci.compareOp = map_cmp_op(d->compare_func);
-    }
+    /*
+     * All 4,544 AIR 2.0 shaders in Oceanhorn 2 bind depth/shadow textures as standard
+     * texture2d<float> (0 depth2d bindings) and sample raw depth values via non-Dref
+     * OpImageGather / OpImageSample*, performing PCF comparison in shader ALU.
+     * In Metal, MTLSamplerDescriptor.compareFunction is ignored for texture2d<float>
+     * gather/sample; in Vulkan (VUID-RuntimeSpirv-OpImage-06376), setting compareEnable=VK_TRUE
+     * on a sampler used with non-Dref OpImageGather/OpImageSample* causes hardware compare
+     * against Dref=0.0, returning 0.0 (100% shadow) across the entire sunlit CSM frustum.
+     */
+    sci.compareEnable = VK_FALSE;
+    sci.compareOp = VK_COMPARE_OP_NEVER;
     VkSampler smp = VK_NULL_HANDLE;
     if (vkCreateSampler(st.vk_ctx.device(), &sci, nullptr, &smp) != VK_SUCCESS) return nullptr;
+    VkSampler nearest_smp = smp;
+    if (sci.minFilter != VK_FILTER_NEAREST || sci.magFilter != VK_FILTER_NEAREST ||
+        sci.mipmapMode != VK_SAMPLER_MIPMAP_MODE_NEAREST || sci.anisotropyEnable != VK_FALSE) {
+        VkSamplerCreateInfo nsci = sci;
+        nsci.minFilter = VK_FILTER_NEAREST;
+        nsci.magFilter = VK_FILTER_NEAREST;
+        nsci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        nsci.anisotropyEnable = VK_FALSE;
+        nsci.maxAnisotropy = 1.0f;
+        if (vkCreateSampler(st.vk_ctx.device(), &nsci, nullptr, &nearest_smp) != VK_SUCCESS) {
+            nearest_smp = smp;
+        }
+    }
     auto *impl = new MtlSamplerImpl();
     impl->sampler = smp;
+    impl->nearest_sampler = nearest_smp;
+    impl->desc = *d;
     return alloc_mtl_wrap_managed("MTLSamplerState", impl, &mtl_sampler_dealloc, false);
 }
 
@@ -1409,6 +1548,8 @@ void register_resource_objc_methods() {
     oh2_objc_register_instance_method("MTLSamplerDescriptor", "setLodMaxClamp:",       (void *)&mtl_sd_set_lmax);
     oh2_objc_register_instance_method("MTLSamplerDescriptor", "compareFunction",       (void *)&mtl_sd_get_cmp);
     oh2_objc_register_instance_method("MTLSamplerDescriptor", "setCompareFunction:",   (void *)&mtl_sd_set_cmp);
+    oh2_objc_register_instance_method("MTLSamplerDescriptor", "borderColor",           (void *)&mtl_sd_get_border);
+    oh2_objc_register_instance_method("MTLSamplerDescriptor", "setBorderColor:",       (void *)&mtl_sd_set_border);
     oh2_objc_register_instance_method("MTLSamplerDescriptor", "normalizedCoordinates", (void *)&mtl_sd_get_norm);
     oh2_objc_register_instance_method("MTLSamplerDescriptor", "setNormalizedCoordinates:", (void *)&mtl_sd_set_norm);
     oh2_objc_register_instance_method("MTLSamplerDescriptor", "lodAverage",            (void *)&mtl_sd_false);
@@ -1545,7 +1686,18 @@ void mtl_sync_all_dirty_buffer_textures_cmd(MtlCommandBufferImpl *cb) {
         snapshot = st.active_buf_textures;
     }
 
+    struct PendingBufTexCopy {
+        MtlTextureImpl   *tex;
+        VkBuffer          src_buf;
+        VkBufferImageCopy bic;
+        VkImageLayout     old_l;
+        uint64_t          cur_gen;
+        uint64_t          cur_hash;
+    };
+    std::vector<PendingBufTexCopy> copies;
+    copies.reserve(snapshot.size());
     std::vector<uint8_t> packed_tmp;
+
     for (MtlTextureImpl *tex : snapshot) {
         if (!tex || !tex->parent_buffer_obj || tex->image == VK_NULL_HANDLE) continue;
         auto *buf = unwrap_mtl<MtlBufferImpl>(tex->parent_buffer_obj);
@@ -1575,7 +1727,12 @@ void mtl_sync_all_dirty_buffer_textures_cmd(MtlCommandBufferImpl *cb) {
         uint64_t total_span = (by * d > 1) ? ((uint64_t)(by * d - 1) * src_row_pitch + packed_row) : packed_row;
         uint64_t align_req = std::max<uint64_t>(4ULL, bsz);
 
-        /* Fast zero-copy path: GPU copies directly from buf->buffer -> tex->image (zero CPU memcpy/alloc!) */
+        VkBuffer src_buf = VK_NULL_HANDLE;
+        VkBufferImageCopy bic{};
+        bic.imageSubresource = {tex->aspect_mask, 0, 0, 1};
+        bic.imageOffset = {0, 0, 0};
+        bic.imageExtent = {w, h, d};
+
         if (buf->buffer != VK_NULL_HANDLE &&
             (tex->buffer_offset % align_req) == 0 &&
             (src_row_pitch % bsz) == 0 &&
@@ -1585,74 +1742,273 @@ void mtl_sync_all_dirty_buffer_textures_cmd(MtlCommandBufferImpl *cb) {
                 if (buf->allocation) {
                     vmaFlushAllocation(st.vk_ctx.allocator(), buf->allocation, tex->buffer_offset, total_span);
                 }
-                VkImageLayout old_l = tex->mip_layouts.empty() ? VK_IMAGE_LAYOUT_UNDEFINED : tex->mip_layouts[0];
-                transition_image_layout(cb->cmd, tex->image, tex->aspect_mask,
-                                        0, 1, 0, 1,
-                                        old_l, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                VkBufferImageCopy bic{};
+                src_buf = buf->buffer;
                 bic.bufferOffset = tex->buffer_offset;
                 bic.bufferRowLength = (h > 1) ? row_texels : 0u;
-                bic.bufferImageHeight = 0;
-                bic.imageSubresource = {tex->aspect_mask, 0, 0, 1};
-                bic.imageOffset = {0, 0, 0};
-                bic.imageExtent = {w, h, d};
-                vkCmdCopyBufferToImage(cb->cmd, buf->buffer, tex->image,
-                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
-                transition_image_layout(cb->cmd, tex->image, tex->aspect_mask,
-                                        0, 1, 0, 1,
-                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                if (!tex->mip_layouts.empty()) tex->mip_layouts[0] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                tex->synced_buf_gen = cur_gen;
-                tex->synced_content_hash = cur_hash;
-                st.prof_buftex_uploads.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        if (src_buf == VK_NULL_HANDLE) {
+            packed_tmp.assign(static_cast<size_t>(total_packed), 0);
+            const uint8_t *src_base = static_cast<const uint8_t *>(buf->mapped) + tex->buffer_offset;
+            if (src_row_pitch == packed_row && avail >= total_packed) {
+                std::memcpy(packed_tmp.data(), src_base, static_cast<size_t>(total_packed));
+            } else {
+                for (uint32_t row = 0; row < by * d; ++row) {
+                    uint64_t src_off = static_cast<uint64_t>(row) * src_row_pitch;
+                    if (src_off >= avail) break;
+                    uint64_t can_copy = std::min<uint64_t>(packed_row, avail - src_off);
+                    std::memcpy(packed_tmp.data() + static_cast<uint64_t>(row) * packed_row,
+                                src_base + src_off, static_cast<size_t>(can_copy));
+                }
+            }
+            uint64_t inline_off = 0;
+            if (!mtl_alloc_inline_bytes(cb, packed_tmp.data(), total_packed, &src_buf, &inline_off)) {
                 continue;
             }
-        }
-
-        /* Fallback packed copy for unaligned offsets or truncated spans */
-        packed_tmp.assign(static_cast<size_t>(total_packed), 0);
-        const uint8_t *src_base = static_cast<const uint8_t *>(buf->mapped) + tex->buffer_offset;
-        if (src_row_pitch == packed_row && avail >= total_packed) {
-            std::memcpy(packed_tmp.data(), src_base, static_cast<size_t>(total_packed));
-        } else {
-            for (uint32_t row = 0; row < by * d; ++row) {
-                uint64_t src_off = static_cast<uint64_t>(row) * src_row_pitch;
-                if (src_off >= avail) break;
-                uint64_t can_copy = std::min<uint64_t>(packed_row, avail - src_off);
-                std::memcpy(packed_tmp.data() + static_cast<uint64_t>(row) * packed_row,
-                            src_base + src_off, static_cast<size_t>(can_copy));
-            }
-        }
-
-        VkBuffer src_buf = VK_NULL_HANDLE;
-        uint64_t src_off = 0;
-        if (!mtl_alloc_inline_bytes(cb, packed_tmp.data(), total_packed, &src_buf, &src_off)) {
-            continue;
+            bic.bufferOffset = inline_off;
+            bic.bufferRowLength = 0;
         }
 
         VkImageLayout old_l = tex->mip_layouts.empty() ? VK_IMAGE_LAYOUT_UNDEFINED : tex->mip_layouts[0];
-        transition_image_layout(cb->cmd, tex->image, tex->aspect_mask,
-                                0, 1, 0, 1,
-                                old_l, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        copies.push_back({tex, src_buf, bic, old_l, cur_gen, cur_hash});
+    }
 
+    if (copies.empty()) return;
+
+    /* Batch all PRE-copy transitions into 1 vkCmdPipelineBarrier, record all copies, then 1 POST-copy barrier */
+    std::vector<VkImageMemoryBarrier> pre_b;
+    std::vector<VkImageMemoryBarrier> post_b;
+    pre_b.reserve(copies.size());
+    post_b.reserve(copies.size());
+    VkPipelineStageFlags pre_src_stages = 0;
+
+    for (const auto &c : copies) {
+        if (c.old_l != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.oldLayout = c.old_l;
+            b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = c.tex->image;
+            b.subresourceRange = {c.tex->aspect_mask, 0, 1, 0, 1};
+            if (c.old_l == VK_IMAGE_LAYOUT_UNDEFINED) {
+                b.srcAccessMask = 0;
+                pre_src_stages |= VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            } else if (c.old_l == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+                b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                pre_src_stages |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            } else {
+                b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+                pre_src_stages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            }
+            b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            pre_b.push_back(b);
+        }
+        VkImageMemoryBarrier pb{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        pb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        pb.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        pb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        pb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        pb.image = c.tex->image;
+        pb.subresourceRange = {c.tex->aspect_mask, 0, 1, 0, 1};
+        pb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        pb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        post_b.push_back(pb);
+    }
+
+    if (!pre_b.empty()) {
+        vkCmdPipelineBarrier(cb->cmd,
+                             pre_src_stages ? pre_src_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr,
+                             static_cast<uint32_t>(pre_b.size()), pre_b.data());
+    }
+    for (const auto &c : copies) {
+        vkCmdCopyBufferToImage(cb->cmd, c.src_buf, c.tex->image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c.bic);
+        if (!c.tex->mip_layouts.empty()) c.tex->mip_layouts[0] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        c.tex->synced_buf_gen = c.cur_gen;
+        c.tex->synced_content_hash = c.cur_hash;
+    }
+    vkCmdPipelineBarrier(cb->cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr,
+                         static_cast<uint32_t>(post_b.size()), post_b.data());
+    st.prof_buftex_uploads.fetch_add(copies.size(), std::memory_order_relaxed);
+}
+
+void mtl_queue_btex_for_preamble(MtlCommandBufferImpl *cb, MtlTextureImpl *tex) {
+    MtlVkState &st = get_state();
+    if (!cb || !tex || !tex->parent_buffer_obj || tex->image == VK_NULL_HANDLE || !st.initialized) return;
+    if (!cb->recording && mtl_begin_command_buffer_internal(cb) == VK_NULL_HANDLE) return;
+    auto *buf = unwrap_mtl<MtlBufferImpl>(tex->parent_buffer_obj);
+    if (!buf || !buf->mapped || tex->buffer_offset >= buf->length) return;
+    uint64_t cur_gen = buf->mod_gen.load(std::memory_order_relaxed);
+    if (tex->synced_buf_gen == cur_gen || tex->synced_cmd_seq == cb->cmd_seq_id) return;
+    tex->synced_cmd_seq = cb->cmd_seq_id;
+    st.frames[cb->frame_idx].preamble_btex_list.push_back(tex);
+}
+
+bool mtl_record_preamble_btex_copies(MtlCommandBufferImpl *cb) {
+    MtlVkState &st = get_state();
+    if (!cb || !st.initialized) return false;
+    FrameSyncSlot &slot = st.frames[cb->frame_idx];
+    if (slot.preamble_btex_list.empty() || slot.preamble_cmd == VK_NULL_HANDLE) {
+        slot.preamble_btex_list.clear();
+        return false;
+    }
+
+    struct PendingBufTexCopy {
+        MtlTextureImpl   *tex;
+        VkBuffer          src_buf;
+        VkBufferImageCopy bic;
+        VkImageLayout     old_l;
+        uint64_t          cur_gen;
+    };
+    std::vector<PendingBufTexCopy> copies;
+    copies.reserve(slot.preamble_btex_list.size());
+    std::vector<uint8_t> packed_tmp;
+
+    for (MtlTextureImpl *tex : slot.preamble_btex_list) {
+        if (!tex || !tex->parent_buffer_obj || tex->image == VK_NULL_HANDLE) continue;
+        auto *buf = unwrap_mtl<MtlBufferImpl>(tex->parent_buffer_obj);
+        if (!buf || !buf->mapped || tex->buffer_offset >= buf->length) continue;
+        uint64_t cur_gen = buf->mod_gen.load(std::memory_order_relaxed);
+        if (tex->synced_buf_gen == cur_gen) continue;
+
+        uint32_t w = std::max(1u, tex->width);
+        uint32_t h = std::max(1u, tex->height);
+        uint32_t d = std::max(1u, tex->depth);
+        uint32_t bw = 1, bh = 1;
+        uint32_t bsz = mtl_pixel_format_block_size(tex->vk_format, &bw, &bh);
+        uint32_t bx = (w + bw - 1u) / bw;
+        uint32_t by = (h + bh - 1u) / bh;
+        uint64_t packed_row = static_cast<uint64_t>(bx) * bsz;
+        uint64_t src_row_pitch = (tex->buffer_bytes_per_row > 0) ? tex->buffer_bytes_per_row : packed_row;
+        uint64_t total_packed = packed_row * by * d;
+        if (total_packed == 0 || total_packed > 4ULL * 1024ULL * 1024ULL) continue;
+
+        uint64_t avail = buf->length - tex->buffer_offset;
+        uint64_t total_span = (by * d > 1) ? ((uint64_t)(by * d - 1) * src_row_pitch + packed_row) : packed_row;
+        uint64_t align_req = std::max<uint64_t>(4ULL, bsz);
+
+        VkBuffer src_buf = VK_NULL_HANDLE;
         VkBufferImageCopy bic{};
-        bic.bufferOffset = src_off;
-        bic.bufferRowLength = 0;
-        bic.bufferImageHeight = 0;
         bic.imageSubresource = {tex->aspect_mask, 0, 0, 1};
         bic.imageOffset = {0, 0, 0};
         bic.imageExtent = {w, h, d};
-        vkCmdCopyBufferToImage(cb->cmd, src_buf, tex->image,
-                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
 
-        transition_image_layout(cb->cmd, tex->image, tex->aspect_mask,
-                                0, 1, 0, 1,
-                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        if (!tex->mip_layouts.empty()) tex->mip_layouts[0] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        tex->synced_buf_gen = cur_gen;
-        tex->synced_content_hash = cur_hash;
-        st.prof_buftex_uploads.fetch_add(1, std::memory_order_relaxed);
+        if (buf->buffer != VK_NULL_HANDLE &&
+            (tex->buffer_offset % align_req) == 0 &&
+            (src_row_pitch % bsz) == 0 &&
+            avail >= total_span) {
+            uint32_t row_texels = (src_row_pitch == packed_row) ? 0u : static_cast<uint32_t>((src_row_pitch / bsz) * bw);
+            if (row_texels == 0 || (row_texels >= w && row_texels <= 65536u)) {
+                if (buf->allocation) {
+                    vmaFlushAllocation(st.vk_ctx.allocator(), buf->allocation, tex->buffer_offset, total_span);
+                }
+                src_buf = buf->buffer;
+                bic.bufferOffset = tex->buffer_offset;
+                bic.bufferRowLength = (h > 1) ? row_texels : 0u;
+            }
+        }
+
+        if (src_buf == VK_NULL_HANDLE) {
+            packed_tmp.assign(static_cast<size_t>(total_packed), 0);
+            const uint8_t *src_base = static_cast<const uint8_t *>(buf->mapped) + tex->buffer_offset;
+            if (src_row_pitch == packed_row && avail >= total_packed) {
+                std::memcpy(packed_tmp.data(), src_base, static_cast<size_t>(total_packed));
+            } else {
+                for (uint32_t row = 0; row < by * d; ++row) {
+                    uint64_t src_off = static_cast<uint64_t>(row) * src_row_pitch;
+                    if (src_off >= avail) break;
+                    uint64_t can_copy = std::min<uint64_t>(packed_row, avail - src_off);
+                    std::memcpy(packed_tmp.data() + static_cast<uint64_t>(row) * packed_row,
+                                src_base + src_off, static_cast<size_t>(can_copy));
+                }
+            }
+            uint64_t inline_off = 0;
+            if (!mtl_alloc_inline_bytes(cb, packed_tmp.data(), total_packed, &src_buf, &inline_off)) {
+                continue;
+            }
+            bic.bufferOffset = inline_off;
+            bic.bufferRowLength = 0;
+        }
+
+        VkImageLayout old_l = tex->mip_layouts.empty() ? VK_IMAGE_LAYOUT_UNDEFINED : tex->mip_layouts[0];
+        copies.push_back({tex, src_buf, bic, old_l, cur_gen});
     }
+    slot.preamble_btex_list.clear();
+    if (copies.empty()) return false;
+
+    VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(slot.preamble_cmd, &begin_info) != VK_SUCCESS) return false;
+
+    std::vector<VkImageMemoryBarrier> pre_b;
+    std::vector<VkImageMemoryBarrier> post_b;
+    pre_b.reserve(copies.size());
+    post_b.reserve(copies.size());
+    VkPipelineStageFlags pre_src_stages = 0;
+
+    for (const auto &c : copies) {
+        if (c.old_l != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.oldLayout = c.old_l;
+            b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = c.tex->image;
+            b.subresourceRange = {c.tex->aspect_mask, 0, 1, 0, 1};
+            if (c.old_l == VK_IMAGE_LAYOUT_UNDEFINED) {
+                b.srcAccessMask = 0;
+                pre_src_stages |= VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            } else if (c.old_l == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+                b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                pre_src_stages |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            } else {
+                b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+                pre_src_stages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            }
+            b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            pre_b.push_back(b);
+        }
+        VkImageMemoryBarrier pb{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        pb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        pb.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        pb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        pb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        pb.image = c.tex->image;
+        pb.subresourceRange = {c.tex->aspect_mask, 0, 1, 0, 1};
+        pb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        pb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        post_b.push_back(pb);
+    }
+
+    if (!pre_b.empty()) {
+        vkCmdPipelineBarrier(slot.preamble_cmd,
+                             pre_src_stages ? pre_src_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr,
+                             static_cast<uint32_t>(pre_b.size()), pre_b.data());
+    }
+    for (const auto &c : copies) {
+        vkCmdCopyBufferToImage(slot.preamble_cmd, c.src_buf, c.tex->image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c.bic);
+        if (!c.tex->mip_layouts.empty()) c.tex->mip_layouts[0] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        c.tex->synced_buf_gen = c.cur_gen;
+    }
+    vkCmdPipelineBarrier(slot.preamble_cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr,
+                         static_cast<uint32_t>(post_b.size()), post_b.data());
+
+    if (vkEndCommandBuffer(slot.preamble_cmd) != VK_SUCCESS) return false;
+    st.prof_buftex_uploads.fetch_add(copies.size(), std::memory_order_relaxed);
+    return true;
 }
 
 void mtl_flush_pending_tex_uploads_cmd(MtlCommandBufferImpl *cb) {
@@ -1694,7 +2050,7 @@ void mtl_flush_pending_tex_uploads_cmd(MtlCommandBufferImpl *cb) {
                 }
             }
             if (ok) {
-                VkImageLayout old_l = tex->mip_layouts[item.level];
+                VkImageLayout old_l = tex->get_subres_layout(item.level, item.slice);
                 transition_image_layout(cb->cmd, tex->image, tex->aspect_mask,
                                         item.level, 1, item.slice, 1,
                                         old_l, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -1715,7 +2071,7 @@ void mtl_flush_pending_tex_uploads_cmd(MtlCommandBufferImpl *cb) {
                 transition_image_layout(cb->cmd, tex->image, tex->aspect_mask,
                                         item.level, 1, item.slice, 1,
                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                tex->mip_layouts[item.level] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                tex->set_subres_layout(item.level, item.slice, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             }
         }
         if (item.tex_obj) oh2_objc_release_object(item.tex_obj);

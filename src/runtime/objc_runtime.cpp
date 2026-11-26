@@ -195,6 +195,18 @@ static void oh2_objc_autoreleasePoolPop(void *pool_token) {
     }
 }
 
+extern "C" void *oh2_rt_autorelease_push(void) {
+    return oh2_objc_autoreleasePoolPush();
+}
+
+extern "C" void oh2_rt_autorelease_pop(void *pool_token) {
+    oh2_objc_autoreleasePoolPop(pool_token);
+}
+
+extern "C" void *oh2_rt_autorelease_add(void *obj) {
+    return oh2_objc_autorelease(obj);
+}
+
 static int oh2_objc_sync_enter(void *obj) {
     if (!obj) return 0;
     return pthread_mutex_lock(get_or_create_sync_lock(obj));

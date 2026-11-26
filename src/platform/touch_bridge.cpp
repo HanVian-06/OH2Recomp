@@ -169,6 +169,7 @@ void oh2_platform_touch_register(void) {
     oh2_objc_register_instance_method("OH2TouchDispatchProxy", "deliverTouch:", (void *)&touch_proxy_deliver);
     if (!g_touch_proxy) {
         g_touch_proxy = oh2_objc_alloc_instance(oh2_objc_get_class("OH2TouchDispatchProxy"), 64);
+        oh2_objc_mark_immortal(g_touch_proxy);
     }
 }
 

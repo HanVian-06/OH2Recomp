@@ -136,9 +136,12 @@ struct MtlBufferImpl {
     VkBuffer      buffer = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
     uint64_t      length = 0;
+    uint64_t      alloc_capacity = 0;
+    uint64_t      unique_id = 0;
     uint64_t      options = 0;
     void         *mapped = nullptr;
     bool          host_coherent = false;
+    bool          bound_as_descriptor = false;
     std::atomic<uint64_t> mod_gen{1};
     std::atomic<bool> needs_host_invalidate{false};
     std::vector<MtlTextureImpl *> buffer_views;
@@ -161,12 +164,21 @@ struct MtlTextureDescriptorImpl {
     uint8_t  allow_gpu_optimized = 1;
 };
 
+struct SubresAttView {
+    uint16_t    level = 0;
+    uint16_t    slice = 0;
+    VkImageView view = VK_NULL_HANDLE;
+};
+
 struct MtlTextureImpl {
     VkImage         image = VK_NULL_HANDLE;
     VmaAllocation   allocation = VK_NULL_HANDLE;
     VkImageView     view = VK_NULL_HANDLE;
+    VkImageView     ds_att_view = VK_NULL_HANDLE;
+    std::vector<SubresAttView> subres_att_views;
     VkFormat        vk_format = VK_FORMAT_B8G8R8A8_UNORM;
     uint64_t        mtl_pixel_format = 80;
+    uint64_t        unique_id = 0;
     uint64_t        texture_type = kMTLTextureType2D;
     uint32_t        width = 1;
     uint32_t        height = 1;
@@ -176,8 +188,20 @@ struct MtlTextureImpl {
     uint32_t        sample_count = 1;
     VkImageAspectFlags aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT;
     std::vector<VkImageLayout> mip_layouts;
+    VkImageLayout get_subres_layout(uint32_t level, uint32_t slice = 0) const {
+        if (mip_levels == 0 || mip_layouts.empty()) return VK_IMAGE_LAYOUT_UNDEFINED;
+        size_t idx = static_cast<size_t>(slice) * mip_levels + level;
+        if (idx < mip_layouts.size()) return mip_layouts[idx];
+        return (level < mip_layouts.size()) ? mip_layouts[level] : VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+    void set_subres_layout(uint32_t level, uint32_t slice, VkImageLayout l) {
+        if (mip_levels == 0 || mip_layouts.empty()) return;
+        size_t idx = static_cast<size_t>(slice) * mip_levels + level;
+        if (idx < mip_layouts.size()) mip_layouts[idx] = l;
+    }
     bool            owns_image = true;
     bool            owns_view = true;
+    bool            bound_as_descriptor = false;
     bool            is_swapchain = false;
     uint32_t        swapchain_image_idx = UINT32_MAX;
     void           *parent_tex_obj = nullptr;
@@ -231,12 +255,15 @@ struct MtlSamplerDescriptorImpl {
     float    lod_min = 0.0f;
     float    lod_max = 1000.0f;
     uint64_t compare_func = 0; /* Never */
+    uint64_t border_color = 0; /* TransparentBlack */
     uint8_t  normalized_coords = 1;
     std::string label;
 };
 
 struct MtlSamplerImpl {
     VkSampler sampler = VK_NULL_HANDLE;
+    VkSampler nearest_sampler = VK_NULL_HANDLE;
+    MtlSamplerDescriptorImpl desc{};
 };
 
 struct MtlStencilDescriptorImpl {
@@ -338,6 +365,14 @@ struct MtlRenderPipelineStateImpl {
     uint32_t ps_used_buf_mask = 0;
     uint32_t ps_used_tex_mask = 0;
     uint32_t ps_used_smp_mask = 0;
+    uint32_t vs_smp_tex_mask[kMaxSamplers]{};
+    uint32_t ps_smp_tex_mask[kMaxSamplers]{};
+    uint32_t vs_dyn_ubo_mask = 0;
+    uint32_t ps_dyn_ubo_mask = 0;
+    uint8_t  vs_dyn_ubo_slots[8]{};
+    uint8_t  ps_dyn_ubo_slots[8]{};
+    uint8_t  vs_dyn_ubo_count = 0;
+    uint8_t  ps_dyn_ubo_count = 0;
     MtlVertexDescriptorImpl vtx_desc_copy{};
     std::unordered_map<uint64_t, VkPipeline> specialized_pipelines;
 };
@@ -414,17 +449,22 @@ struct MtlStageBindings {
     VkBuffer buffer[kMaxBuffers]{};
     uint64_t buffer_offset[kMaxBuffers]{};
     uint64_t buffer_range[kMaxBuffers]{};
-    uint64_t buffer_total_len[kMaxBuffers]{};
-    uint8_t *buffer_mapped[kMaxBuffers]{};
-    void    *buffer_obj[kMaxBuffers]{};
-    bool     buffer_bound[kMaxBuffers]{};
+    uint64_t     buffer_total_len[kMaxBuffers]{};
+    uint64_t     buffer_uid[kMaxBuffers]{};
+    uint8_t     *buffer_mapped[kMaxBuffers]{};
+    void        *buffer_obj[kMaxBuffers]{};
+    bool         buffer_bound[kMaxBuffers]{};
 
-    VkImageView tex_view[kMaxTextures]{};
-    void       *tex_obj[kMaxTextures]{};
+    VkImageView  tex_view[kMaxTextures]{};
+    uint64_t     tex_uid[kMaxTextures]{};
+    void        *tex_obj[kMaxTextures]{};
     bool        tex_is_depth[kMaxTextures]{};
     bool        tex_bound[kMaxTextures]{};
+    uint32_t    depth_tex_mask = 0;
 
     VkSampler sampler[kMaxSamplers]{};
+    VkSampler sampler_nearest[kMaxSamplers]{};
+    void     *sampler_obj[kMaxSamplers]{};
     bool      sampler_bound[kMaxSamplers]{};
     bool      desc_dirty = true;
     uint32_t  dirty_buf_mask = 0xFFFFFFFFu;
@@ -435,6 +475,7 @@ struct MtlStageBindings {
 
 struct MtlCommandBufferImpl {
     uint32_t frame_idx = 0;
+    uint32_t fb_snap_seq = 0;
     uint64_t cmd_seq_id = 0;
     uint64_t begin_ns = 0;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -471,6 +512,7 @@ struct MtlRenderEncoderImpl {
     uint64_t cull_mode = kMTLCullNone;
     uint64_t front_winding = kMTLWindingCW;
     uint64_t fill_mode = 0; /* Fill */
+    uint64_t depth_clip_mode = 0; /* 0=Clip, 1=Clamp */
     uint32_t stencil_ref = 0;
     float depth_bias = 0.0f;
     float depth_slope = 0.0f;
@@ -491,11 +533,16 @@ struct MtlRenderEncoderImpl {
     uint64_t bound_cull = UINT64_MAX;
     uint64_t bound_wind = UINT64_MAX;
     uint64_t bound_fill = UINT64_MAX;
+    uint64_t bound_depth_clip = UINT64_MAX;
     VkDescriptorSet bound_set0 = VK_NULL_HANDLE;
     VkDescriptorSetLayout bound_set0_layout = VK_NULL_HANDLE;
     VkDescriptorSet bound_set1 = VK_NULL_HANDLE;
     VkDescriptorSetLayout bound_set1_layout = VK_NULL_HANDLE;
     VkPipelineLayout bound_pipe_layout = VK_NULL_HANDLE;
+    uint32_t bound_set0_dyn_offsets[8]{};
+    uint32_t bound_set1_dyn_offsets[8]{};
+    uint8_t  bound_set0_dyn_count = 0;
+    uint8_t  bound_set1_dyn_count = 0;
     bool viewport_dirty = true;
     bool scissor_dirty = true;
     bool depth_bias_dirty = true;
@@ -506,6 +553,8 @@ struct MtlRenderEncoderImpl {
     bool occ_query_active = false;
     uint32_t occ_active_qidx = 0;
     bool fb_fetch_snap_valid = false;
+    bool fb_fetch_alpha_dirty = true;
+    bool fb_fetch_rgb_dirty = true;
     void *fb_fetch_last_pso = nullptr;
     uint32_t ts_pass_idx = UINT32_MAX;
     uint32_t pass_draws = 0;
@@ -540,7 +589,7 @@ struct MtlObjWrap {
 static constexpr uint32_t kMaxFramesInFlight = 8;
 static constexpr uint32_t kMaxOcclusionQueriesPerCB = 2048;
 static constexpr uint32_t kMaxTimestampQueriesPerCB = 128;
-static constexpr uint32_t kDescCacheSize = 1024;
+static constexpr uint32_t kDescCacheSize = 4096;
 
 struct DescCacheEntry {
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
@@ -573,11 +622,15 @@ struct PendingCbCompletion {
 struct FrameSyncSlot {
     VkCommandPool                    cmd_pool = VK_NULL_HANDLE;
     VkCommandBuffer                  cmd = VK_NULL_HANDLE;
+    VkCommandBuffer                  preamble_cmd = VK_NULL_HANDLE;
+    std::vector<MtlTextureImpl *>    preamble_btex_list;
     VkDescriptorPool                 desc_pool = VK_NULL_HANDLE;
     std::vector<VkDescriptorPool>    overflow_desc_pools;
     uint32_t                         active_desc_pool_idx = 0;
     DescCacheEntry                   desc_cache[kDescCacheSize]{};
     uint32_t                         desc_cache_epoch = 1;
+    uint64_t                         desc_pool_resource_gen = 0;
+    uint32_t                         desc_sets_allocated = 0;
     VkQueryPool                      occ_query_pool = VK_NULL_HANDLE;
     uint32_t                         occ_query_cursor = 0;
     VkQueryPool                      ts_query_pool = VK_NULL_HANDLE;
@@ -608,6 +661,8 @@ struct DeferredDestroy {
     VkBuffer      buffer = VK_NULL_HANDLE;
     VkImage       image = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
+    void         *mapped = nullptr;
+    uint64_t      capacity = 0;
     VkImageView   image_view = VK_NULL_HANDLE;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
     VkSampler     sampler = VK_NULL_HANDLE;
@@ -655,6 +710,13 @@ struct MtlVkState {
     uint32_t                     virtual_render_w = 0;
     uint32_t                     virtual_render_h = 0;
     bool                         use_virtual_drawable = false;
+    struct PooledVkBuffer {
+        VkBuffer      buffer = VK_NULL_HANDLE;
+        VmaAllocation allocation = VK_NULL_HANDLE;
+        void         *mapped = nullptr;
+        uint64_t      capacity = 0;
+    };
+    std::vector<PooledVkBuffer>  buffer_pool[5];
     std::vector<DeferredDestroy> deferred_destroys;
     uint32_t                     next_frame_idx = 0;
     bool                         swapchain_out_of_date = false;
@@ -732,15 +794,28 @@ struct MtlVkState {
     std::atomic<uint64_t> prof_imm_up_cnt{0};
     std::atomic<uint64_t> prof_desc_hits{0};
     std::atomic<uint64_t> prof_desc_misses{0};
+    std::atomic<uint64_t> prof_desc_resets{0};
+    std::atomic<uint64_t> prof_cb_rec_us{0};
+    std::atomic<uint64_t> desc_resource_gen{1};
     float                 timestamp_period_ns = 1.0f;
+    uint32_t              max_dyn_ubo_per_stage = 0;
+    uint64_t              min_ubo_offset_align = 256;
+    uint32_t              present_ring_fidx[2]{UINT32_MAX, UINT32_MAX};
+    uint32_t              present_ring_pos = 0;
 
-    /* Cached snapshot image for Metal programmable blending / framebuffer fetch (color(0)) */
-    VkImage       fb_fetch_image = VK_NULL_HANDLE;
-    VmaAllocation fb_fetch_alloc = VK_NULL_HANDLE;
-    VkImageView   fb_fetch_view = VK_NULL_HANDLE;
-    uint32_t      fb_fetch_w = 0;
-    uint32_t      fb_fetch_h = 0;
-    VkFormat      fb_fetch_fmt = VK_FORMAT_UNDEFINED;
+    /* Persistent multi-resolution/format snapshot pool for Metal programmable blending (color(0)) */
+    struct FbFetchPoolEntry {
+        uint32_t      w = 0;
+        uint32_t      h = 0;
+        VkFormat      fmt = VK_FORMAT_UNDEFINED;
+        uint32_t      occ = 0;
+        VkImage       image = VK_NULL_HANDLE;
+        VmaAllocation alloc = VK_NULL_HANDLE;
+        VkImageView   view = VK_NULL_HANDLE;
+        uint64_t      uid = 0;
+        bool          initialized = false;
+    };
+    std::vector<FbFetchPoolEntry> fb_fetch_pool;
 };
 
 MtlVkState &get_state();
@@ -773,8 +848,9 @@ inline T *unwrap_mtl(void *obj) {
     return ((MtlObjWrap<T> *)obj)->impl;
 }
 
+uint64_t next_mtl_resource_uid();
 VkDescriptorPool create_frame_descriptor_pool(VkDevice dev);
-void enqueue_deferred_buffer(VkBuffer buf, VmaAllocation alloc);
+void enqueue_deferred_buffer(VkBuffer buf, VmaAllocation alloc, void *mapped = nullptr, uint64_t capacity = 0);
 void enqueue_deferred_image(VkImage img, VmaAllocation alloc, VkImageView view);
 void enqueue_deferred_view(VkImageView view);
 void enqueue_deferred_framebuffer(VkFramebuffer fb);
@@ -796,12 +872,16 @@ VkPipeline   get_or_create_specialized_graphics_pipeline(MtlRenderPipelineStateI
                                                          uint64_t cull_mode,
                                                          uint64_t front_winding,
                                                          uint64_t fill_mode,
+                                                         uint64_t depth_clip_mode,
                                                          const VkFormat *color_fmts,
                                                          uint32_t color_count,
                                                          VkFormat depth_fmt,
                                                          VkFormat stencil_fmt,
                                                          VkRenderPass compat_rp);
-VkDescriptorSetLayout create_stage_descriptor_layout(const SpirvShaderEntry *entry, VkShaderStageFlags stage_flag);
+VkDescriptorSetLayout create_stage_descriptor_layout(const SpirvShaderEntry *entry, VkShaderStageFlags stage_flag,
+                                                     uint32_t *out_dyn_slot_mask = nullptr,
+                                                     uint8_t *out_dyn_slots = nullptr,
+                                                     uint8_t *out_dyn_count = nullptr);
 
 /* Frame synchronization & command execution */
 VkCommandBuffer mtl_begin_command_buffer_internal(MtlCommandBufferImpl *cb);
@@ -810,6 +890,8 @@ bool            mtl_commit_command_buffer_internal(void *cb_obj, bool wait_compl
 bool            mtl_alloc_inline_bytes(MtlCommandBufferImpl *cb, const void *data, uint64_t len, VkBuffer *out_buf, uint64_t *out_off);
 void            mtl_sync_buffer_backed_texture_if_dirty(MtlTextureImpl *tex);
 void            mtl_sync_all_dirty_buffer_textures_cmd(MtlCommandBufferImpl *cb);
+void            mtl_queue_btex_for_preamble(MtlCommandBufferImpl *cb, MtlTextureImpl *tex);
+bool            mtl_record_preamble_btex_copies(MtlCommandBufferImpl *cb);
 void            mtl_flush_pending_tex_uploads_cmd(MtlCommandBufferImpl *cb);
 
 } // namespace oh2::mtlvk

@@ -12,6 +12,7 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../src/runtime       ${CMAKE_CURRE
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../src/vk_foundation ${CMAKE_CURRENT_BINARY_DIR}/vk_foundation_build)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../src/metal_vk      ${CMAKE_CURRENT_BINARY_DIR}/metal_vk_build)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../src/platform      ${CMAKE_CURRENT_BINARY_DIR}/platform_build)
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../src/air2spirv_cpp ${CMAKE_CURRENT_BINARY_DIR}/air2spirv_cpp_build)
 
 set(NATIVE_APP_GLUE_DIR "${ANDROID_NDK}/sources/android/native_app_glue")
 if(NOT EXISTS "${NATIVE_APP_GLUE_DIR}/android_native_app_glue.c")
@@ -20,6 +21,7 @@ endif()
 
 add_library(oh2_android SHARED
     src/oh2_android_main.cpp
+    src/oh2_jni_bridge.cpp
     "${NATIVE_APP_GLUE_DIR}/android_native_app_glue.c"
 )
 
@@ -31,6 +33,7 @@ target_include_directories(oh2_android PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../../src/vk_foundation/include
     ${CMAKE_CURRENT_LIST_DIR}/../../src/metal_vk
     ${CMAKE_CURRENT_LIST_DIR}/../../src/platform
+    ${CMAKE_CURRENT_LIST_DIR}/../../src/air2spirv_cpp
 )
 
 target_compile_options(oh2_android PRIVATE
@@ -48,6 +51,7 @@ target_link_options(oh2_android PRIVATE
 )
 
 target_link_libraries(oh2_android PRIVATE
+    oh2_air2spirv
     oh2_platform
     oh2_metal_vk
     oh2_runtime_static

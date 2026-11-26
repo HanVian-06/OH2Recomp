@@ -21,11 +21,25 @@
         android:label="Oceanhorn 2"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
-        android:hasCode="false"
+        android:hasCode="true"
         android:debuggable="true"
         android:enableOnBackInvokedCallback="false"
         android:gwpAsanMode="never"
         android:extractNativeLibs="false">
+
+        <activity
+            android:name="com.oceanhorn2.port.LauncherActivity"
+            android:label="Oceanhorn 2"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:screenOrientation="landscape"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="orientation|keyboardHidden|keyboard|navigation|screenSize|screenLayout|smallestScreenSize|uiMode|density|fontScale|locale|layoutDirection">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
 
         <activity
             android:name="android.app.NativeActivity"
@@ -40,10 +54,6 @@
             <meta-data
                 android:name="android.app.lib_name"
                 android:value="oh2_android" />
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
         </activity>
     </application>
 </manifest>

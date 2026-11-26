@@ -33,6 +33,9 @@ extern "C" {
 void oh2_objc_msgSend(void);
 void oh2_dispatch_drain_main_queue(void);
 void oh2_perform_selector_on_main_thread(void *target, const char *selector, void *arg, int wait);
+void *oh2_rt_autorelease_push(void);
+void oh2_rt_autorelease_pop(void *pool_token);
+void *oh2_rt_autorelease_add(void *obj);
 }
 
 #define DARWIN_DATE_EPOCH_OFFSET 978307200.0
@@ -399,6 +402,7 @@ static void *m2_nsthread_mainThread(void *cls, const char *sel) {
     std::lock_guard<std::mutex> lk(g_ns_mutex);
     if (!g_ns_main_thread) {
         g_ns_main_thread = oh2_objc_alloc_instance(oh2_objc_get_class("NSThread"), sizeof(NSOpaquePayload));
+        oh2_objc_mark_immortal(g_ns_main_thread);
         g_main_app_tid = pthread_self();
     }
     return g_ns_main_thread;
@@ -489,6 +493,7 @@ static void *m2_nsrl_mainRunLoop(void *cls, const char *sel) {
     std::lock_guard<std::mutex> lk(g_ns_mutex);
     if (!g_ns_main_runloop) {
         g_ns_main_runloop = oh2_objc_alloc_instance(oh2_objc_get_class("NSRunLoop"), sizeof(NSOpaquePayload));
+        oh2_objc_mark_immortal(g_ns_main_runloop);
     }
     return g_ns_main_runloop;
 }
@@ -641,6 +646,7 @@ static void *m2_nsud_standard(void *cls, const char *sel) {
     std::lock_guard<std::mutex> lk(g_ns_mutex);
     if (!g_ns_user_defaults) {
         g_ns_user_defaults = oh2_objc_alloc_instance(oh2_objc_get_class("NSUserDefaults"), sizeof(NSOpaquePayload));
+        oh2_objc_mark_immortal(g_ns_user_defaults);
     }
     return g_ns_user_defaults;
 }
@@ -688,14 +694,14 @@ static void *m2_nsdate_date(void *cls, const char *sel) {
     (void)cls; (void)sel;
     void *obj = oh2_objc_alloc_instance(oh2_objc_get_class("NSDate"), sizeof(NSOpaquePayload));
     if (obj) ((NSOpaquePayload *)obj)->date_ref = current_darwin_ref_secs();
-    return obj;
+    return oh2_rt_autorelease_add(obj);
 }
 
 static void *m2_nsdate_dateWithTimeIntervalSinceNow(void *cls, const char *sel, double dt) {
     (void)cls; (void)sel;
     void *obj = oh2_objc_alloc_instance(oh2_objc_get_class("NSDate"), sizeof(NSOpaquePayload));
     if (obj) ((NSOpaquePayload *)obj)->date_ref = current_darwin_ref_secs() + dt;
-    return obj;
+    return oh2_rt_autorelease_add(obj);
 }
 
 static double m2_nsdate_timeIntervalSinceRef_cls(void *cls, const char *sel) {
@@ -970,7 +976,7 @@ static void m2_nsobject_performOnMain(void *self, const char *sel, const char *t
  * ============================================================================ */
 static void *m2_nsarr_arrayWithCapacity(void *cls, const char *sel, uint64_t cap) {
     (void)cls; (void)sel; (void)cap;
-    return oh2_objc_array_create(nullptr, 0);
+    return oh2_rt_autorelease_add(oh2_objc_array_create(nullptr, 0));
 }
 
 static void *m2_nsarr_initWithCapacity(void *self, const char *sel, uint64_t cap) {
@@ -981,7 +987,7 @@ static void *m2_nsarr_initWithCapacity(void *self, const char *sel, uint64_t cap
 
 static void *m2_nsdict_dictWithCapacity(void *cls, const char *sel, uint64_t cap) {
     (void)cls; (void)sel; (void)cap;
-    return oh2_objc_dict_create();
+    return oh2_rt_autorelease_add(oh2_objc_dict_create());
 }
 
 static void *m2_nsdict_initWithCapacity(void *self, const char *sel, uint64_t cap) {
@@ -1679,7 +1685,12 @@ static uint8_t m5_ns_ret_yes(void *s, const char *sel) { (void)s; (void)sel; ret
 static void *m5_ns_ret_nil(void *s, const char *sel) { (void)s; (void)sel; return nullptr; }
 static void *m5_ns_ret_self(void *s, const char *sel) { (void)sel; return s; }
 static void m5_ns_noop(void *s, const char *sel) { (void)s; (void)sel; }
-static void *m5_ns_singleton(void *c, const char *sel) { (void)sel; return oh2_objc_alloc_instance(c, 64); }
+static void *m5_ns_singleton(void *c, const char *sel) {
+    (void)sel;
+    void *o = oh2_objc_alloc_instance(c, 64);
+    oh2_objc_mark_immortal(o);
+    return o;
+}
 static void *m5_ns_prefLangs(void *c, const char *sel) {
     (void)c; (void)sel;
     const void *en = oh2_objc_create_string("en-US");
@@ -1697,8 +1708,53 @@ static void *m5_nsbr_beginAccess(void *self, const char *sel, void *handler) {
 static void *m5_nsop_mainQueue(void *cls, const char *sel) {
     (void)sel;
     static void *mq = nullptr;
-    if (!mq) mq = oh2_objc_alloc_instance(cls, 64);
+    if (!mq) {
+        mq = oh2_objc_alloc_instance(cls, 64);
+        oh2_objc_mark_immortal(mq);
+    }
     return mq;
+}
+
+/* NSAutoreleasePool */
+static void *m2_nsarp_init(void *self, const char *sel) {
+    (void)sel;
+    if (self) {
+        ((NSOpaquePayload *)self)->object = oh2_rt_autorelease_push();
+    }
+    return self;
+}
+static void m2_nsarp_dealloc(void *self, const char *sel) {
+    (void)sel;
+    if (self) {
+        void *tok = ((NSOpaquePayload *)self)->object;
+        ((NSOpaquePayload *)self)->object = nullptr;
+        if (tok) oh2_rt_autorelease_pop(tok);
+    }
+}
+static void m2_nsarp_drain(void *self, const char *sel) {
+    (void)sel;
+    if (!self) return;
+    oh2_objc_release_object(self);
+}
+
+/* NSURL / NSSet dealloc helpers */
+static void m2_nsurl_dealloc(void *self, const char *sel) {
+    (void)sel;
+    if (self) {
+        auto *p = (NSOpaquePayload *)self;
+        delete p->str_val;
+        p->str_val = nullptr;
+    }
+}
+static void m2_nsset_dealloc(void *self, const char *sel) {
+    (void)sel;
+    if (self) {
+        auto *p = (NSOpaquePayload *)self;
+        delete p->set_objs;
+        p->set_objs = nullptr;
+        delete p->set_items;
+        p->set_items = nullptr;
+    }
 }
 static void m5_nsop_addBlock(void *self, const char *sel, void *blk) {
     (void)self; (void)sel;
@@ -1962,6 +2018,14 @@ void oh2_m2_register_ns_bridges(void) {
     oh2_objc_register_instance_method("NSObject", "valueForKey:",                  (void *)&m5_ns_ret_nil);
     oh2_objc_register_instance_method("NSObject", "addObserver:forKeyPath:options:context:", (void *)&m5_ns_noop);
     oh2_objc_register_instance_method("NSObject", "removeObserver:forKeyPath:",    (void *)&m5_ns_noop);
+
+    /* NSAutoreleasePool + dealloc cleanup for NSURL/NSSet */
+    oh2_objc_register_instance_method("NSAutoreleasePool", "init",    (void *)&m2_nsarp_init);
+    oh2_objc_register_instance_method("NSAutoreleasePool", "drain",   (void *)&m2_nsarp_drain);
+    oh2_objc_register_instance_method("NSAutoreleasePool", "dealloc", (void *)&m2_nsarp_dealloc);
+    oh2_objc_register_instance_method("NSURL",             "dealloc", (void *)&m2_nsurl_dealloc);
+    oh2_objc_register_instance_method("NSSet",             "dealloc", (void *)&m2_nsset_dealloc);
+    oh2_objc_register_instance_method("NSMutableSet",      "dealloc", (void *)&m2_nsset_dealloc);
 }
 
 } /* extern "C" */

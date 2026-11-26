@@ -521,6 +521,7 @@ bool VkContext::create_allocator() {
     alloc_info.device = device_;
     alloc_info.instance = instance_;
     alloc_info.vulkanApiVersion = VK_API_VERSION_1_1;
+    alloc_info.preferredLargeHeapBlockSize = 32ULL * 1024ULL * 1024ULL;
     alloc_info.pVulkanFunctions = &vma_funcs;
 
     VkResult res = vmaCreateAllocator(&alloc_info, &allocator_);
@@ -609,6 +610,20 @@ bool VkContext::create_swapchain(ANativeWindow* window) {
         sc_usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     }
 
+    VkPresentModeKHR chosen_present_mode = VK_PRESENT_MODE_FIFO_KHR;
+    uint32_t pm_count = 0;
+    if (vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device_, surface_, &pm_count, nullptr) == VK_SUCCESS && pm_count > 0) {
+        std::vector<VkPresentModeKHR> pmodes(pm_count);
+        if (vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device_, surface_, &pm_count, pmodes.data()) == VK_SUCCESS) {
+            for (VkPresentModeKHR pm : pmodes) {
+                if (pm == VK_PRESENT_MODE_MAILBOX_KHR) {
+                    chosen_present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+                    break;
+                }
+            }
+        }
+    }
+
     VkSwapchainCreateInfoKHR sc_info{};
     sc_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     sc_info.surface = surface_;
@@ -621,7 +636,7 @@ bool VkContext::create_swapchain(ANativeWindow* window) {
     sc_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     sc_info.preTransform = pre_transform;
     sc_info.compositeAlpha = composite_alpha;
-    sc_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    sc_info.presentMode = chosen_present_mode;
     sc_info.clipped = VK_TRUE;
 
     VkResult res = vkCreateSwapchainKHR(device_, &sc_info, nullptr, &swapchain_);

@@ -3,12 +3,18 @@
  * plus oh2_libc_wrapper_register_symbols() symbol table registration.
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "libc_wrapper.h"
 
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #define DARWIN_MUTEX_MAGIC_BASE  0x32aaaba0U
@@ -245,6 +251,41 @@ int oh2_darwin_pthread_create(void *thread_out, const void *attr, void *(*start)
     return rc;
 }
 
+static pthread_once_t g_big_core_once = PTHREAD_ONCE_INIT;
+static cpu_set_t      g_big_core_mask;
+static int            g_big_core_valid = 0;
+
+static void init_big_core_mask(void) {
+    unsigned long long freqs[16] = {0};
+    unsigned long long min_f = ~0ULL, max_f = 0;
+    int ncpus = 0;
+    for (int c = 0; c < 16; ++c) {
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+        FILE *fp = fopen(path, "r");
+        if (!fp) break;
+        unsigned long long f = 0;
+        if (fscanf(fp, "%llu", &f) == 1 && f > 0) {
+            freqs[c] = f;
+            if (f < min_f) min_f = f;
+            if (f > max_f) max_f = f;
+        }
+        fclose(fp);
+        ncpus = c + 1;
+    }
+    if (ncpus > 1 && max_f > min_f) {
+        CPU_ZERO(&g_big_core_mask);
+        int cnt = 0;
+        for (int c = 0; c < ncpus; ++c) {
+            if (freqs[c] > min_f) {
+                CPU_SET(c, &g_big_core_mask);
+                cnt++;
+            }
+        }
+        if (cnt > 0) g_big_core_valid = 1;
+    }
+}
+
 int oh2_darwin_pthread_setname_np(const char *name) {
     char safe[16];
     if (!name || !name[0]) {
@@ -252,6 +293,19 @@ int oh2_darwin_pthread_setname_np(const char *name) {
     } else {
         /* Linux prctl/pthread_setname_np strictly limits thread names to 15 chars + NUL */
         snprintf(safe, sizeof(safe), "%.15s", name);
+        const int is_crit = (strncmp(name, "UE4MainApp", 10) == 0 ||
+                             strncmp(name, "GameThread", 10) == 0 ||
+                             strncmp(name, "RenderThread", 12) == 0 ||
+                             strncmp(name, "RHIThread", 9) == 0 ||
+                             strncmp(name, "OH2_AndroidMain", 15) == 0);
+        const int is_tg   = (strncmp(name, "TaskGraph", 9) == 0);
+        if (is_crit || is_tg) {
+            pthread_once(&g_big_core_once, init_big_core_mask);
+            if (g_big_core_valid) {
+                sched_setaffinity(0, sizeof(g_big_core_mask), &g_big_core_mask);
+            }
+            setpriority(PRIO_PROCESS, 0, is_crit ? -8 : -4);
+        }
     }
     return pthread_setname_np(pthread_self(), safe);
 }

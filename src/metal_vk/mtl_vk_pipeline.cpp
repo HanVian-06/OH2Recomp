@@ -713,9 +713,49 @@ static void *mtl_device_newRenderPipelineState(void *self, const char *sel, void
     compute_stage_masks(pso->vs, pso->vs_used_buf_mask, pso->vs_used_tex_mask, pso->vs_used_smp_mask);
     compute_stage_masks(pso->ps, pso->ps_used_buf_mask, pso->ps_used_tex_mask, pso->ps_used_smp_mask);
 
-    /* Set 0 (VS) & Set 1 (PS) layouts strictly matching M4 spirv_cache.h ABI */
-    pso->set0_layout = create_stage_descriptor_layout(pso->vs, VK_SHADER_STAGE_VERTEX_BIT);
-    pso->set1_layout = create_stage_descriptor_layout(pso->ps, VK_SHADER_STAGE_FRAGMENT_BIT);
+    /* Scan SPIR-V OpSampledImage pairs so samplers used with depth textures can auto-downgrade
+       from VK_FILTER_LINEAR to VK_FILTER_NEAREST (required by VUID-vkCmdDraw-magFilter-04553). */
+    auto compute_smp_tex_masks = [](const SpirvShaderEntry *entry, uint32_t out_mask[kMaxSamplers]) {
+        std::memset(out_mask, 0, sizeof(uint32_t) * kMaxSamplers);
+        if (!entry || !entry->spirv_words || entry->spirv_size_bytes < 20) return;
+        const uint32_t *w = entry->spirv_words;
+        const uint32_t n = (uint32_t)(entry->spirv_size_bytes / 4u);
+        std::unordered_map<uint32_t, uint32_t> id_to_binding;
+        std::unordered_map<uint32_t, uint32_t> loaded_tex_slot;
+        std::unordered_map<uint32_t, uint32_t> loaded_smp_slot;
+        for (uint32_t i = 5; i < n; ) {
+            uint32_t wc = w[i] >> 16;
+            uint32_t op = w[i] & 0xFFFFu;
+            if (wc == 0 || i + wc > n) break;
+            if (op == 71 /* OpDecorate */ && wc >= 4 && w[i + 2] == 33 /* Binding */) {
+                id_to_binding[w[i + 1]] = w[i + 3];
+            } else if (op == 61 /* OpLoad */ && wc >= 4) {
+                auto it = id_to_binding.find(w[i + 3]);
+                if (it != id_to_binding.end()) {
+                    uint32_t b = it->second;
+                    if (b >= 32 && b < 32 + kMaxTextures) loaded_tex_slot[w[i + 2]] = b - 32;
+                    else if (b >= 64 && b < 64 + kMaxSamplers) loaded_smp_slot[w[i + 2]] = b - 64;
+                }
+            } else if (op == 86 /* OpSampledImage */ && wc >= 5) {
+                auto tit = loaded_tex_slot.find(w[i + 3]);
+                auto sit = loaded_smp_slot.find(w[i + 4]);
+                if (tit != loaded_tex_slot.end() && sit != loaded_smp_slot.end()) {
+                    if (sit->second < kMaxSamplers && tit->second < kMaxTextures) {
+                        out_mask[sit->second] |= (1u << tit->second);
+                    }
+                }
+            }
+            i += wc;
+        }
+    };
+    compute_smp_tex_masks(pso->vs, pso->vs_smp_tex_mask);
+    compute_smp_tex_masks(pso->ps, pso->ps_smp_tex_mask);
+
+    /* Set 0 (VS) & Set 1 (PS) layouts strictly matching M4 spirv_cache.h ABI (dynamic UBOs for high descriptor reuse) */
+    pso->set0_layout = create_stage_descriptor_layout(pso->vs, VK_SHADER_STAGE_VERTEX_BIT,
+                                                      &pso->vs_dyn_ubo_mask, pso->vs_dyn_ubo_slots, &pso->vs_dyn_ubo_count);
+    pso->set1_layout = create_stage_descriptor_layout(pso->ps, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                                      &pso->ps_dyn_ubo_mask, pso->ps_dyn_ubo_slots, &pso->ps_dyn_ubo_count);
     VkDescriptorSetLayout set_layouts[2] = {pso->set0_layout, pso->set1_layout};
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plci.setLayoutCount = 2;
@@ -796,8 +836,39 @@ static uint64_t mtl_cpso_execWidth(void *s, const char *sel) {
 
 } // namespace
 
-VkDescriptorSetLayout create_stage_descriptor_layout(const SpirvShaderEntry *entry, VkShaderStageFlags stage_flag) {
+VkDescriptorSetLayout create_stage_descriptor_layout(const SpirvShaderEntry *entry, VkShaderStageFlags stage_flag,
+                                                     uint32_t *out_dyn_slot_mask,
+                                                     uint8_t *out_dyn_slots,
+                                                     uint8_t *out_dyn_count) {
     MtlVkState &st = get_state();
+    if (out_dyn_slot_mask) *out_dyn_slot_mask = 0;
+    if (out_dyn_count) *out_dyn_count = 0;
+
+    uint32_t dyn_mask = 0;
+    if (entry && entry->bindings && entry->binding_count > 0 &&
+        out_dyn_slot_mask && out_dyn_slots && out_dyn_count &&
+        st.max_dyn_ubo_per_stage > 0) {
+        std::vector<std::pair<uint8_t, uint8_t>> ubo_binds; /* (vk_binding, metal_slot) */
+        ubo_binds.reserve(8);
+        for (uint16_t i = 0; i < entry->binding_count; ++i) {
+            const SpirvBindingDesc &b = entry->bindings[i];
+            if (b.descriptor_type == SPIRV_VK_DESC_UNIFORM_BUFFER && b.metal_slot < kMaxBuffers) {
+                ubo_binds.push_back({b.binding, b.metal_slot});
+            }
+        }
+        std::sort(ubo_binds.begin(), ubo_binds.end(),
+                  [](const auto &a, const auto &b) { return a.first < b.first; });
+        const uint32_t limit = std::min<uint32_t>(st.max_dyn_ubo_per_stage, 8u);
+        uint8_t dcnt = 0;
+        for (const auto &ub : ubo_binds) {
+            if (dcnt >= limit) break;
+            dyn_mask |= (1u << ub.second);
+            out_dyn_slots[dcnt++] = ub.second;
+        }
+        *out_dyn_slot_mask = dyn_mask;
+        *out_dyn_count = dcnt;
+    }
+
     std::vector<VkDescriptorSetLayoutBinding> bindings;
     if (entry && entry->bindings && entry->binding_count > 0) {
         bindings.reserve(entry->binding_count);
@@ -812,7 +883,11 @@ VkDescriptorSetLayout create_stage_descriptor_layout(const SpirvShaderEntry *ent
                 case SPIRV_VK_DESC_SAMPLED_IMAGE:  vk_b.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; break;
                 case SPIRV_VK_DESC_STORAGE_IMAGE:  vk_b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; break;
                 case SPIRV_VK_DESC_STORAGE_BUFFER: vk_b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; break;
-                default:                           vk_b.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; break;
+                default:
+                    vk_b.descriptorType = (b.metal_slot < kMaxBuffers && (dyn_mask & (1u << b.metal_slot)) != 0)
+                                              ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+                                              : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                    break;
             }
             bindings.push_back(vk_b);
         }
@@ -913,6 +988,7 @@ VkPipeline get_or_create_specialized_graphics_pipeline(MtlRenderPipelineStateImp
                                                          uint64_t cull_mode,
                                                          uint64_t front_winding,
                                                          uint64_t fill_mode,
+                                                         uint64_t depth_clip_mode,
                                                          const VkFormat *color_fmts,
                                                          uint32_t color_count,
                                                          VkFormat depth_fmt,
@@ -927,6 +1003,7 @@ VkPipeline get_or_create_specialized_graphics_pipeline(MtlRenderPipelineStateImp
     mix(cull_mode);
     mix(front_winding);
     mix(fill_mode);
+    mix(depth_clip_mode);
     mix(color_count);
     for (uint32_t i = 0; i < color_count; ++i) mix((uint64_t)color_fmts[i]);
     mix((uint64_t)depth_fmt);
@@ -1003,7 +1080,8 @@ VkPipeline get_or_create_specialized_graphics_pipeline(MtlRenderPipelineStateImp
             VkVertexInputBindingDescription vbd{};
             vbd.binding = (uint32_t)a.buffer_index;
             vbd.stride = (uint32_t)pso->vtx_desc_copy.layouts[a.buffer_index].stride;
-            vbd.inputRate = (pso->vtx_desc_copy.layouts[a.buffer_index].step_function == 2)
+            vbd.inputRate = (pso->vtx_desc_copy.layouts[a.buffer_index].step_function == 2 ||
+                             pso->vtx_desc_copy.layouts[a.buffer_index].step_function == 0)
                                 ? VK_VERTEX_INPUT_RATE_INSTANCE
                                 : VK_VERTEX_INPUT_RATE_VERTEX;
             vbindings.push_back(vbd);
@@ -1037,6 +1115,7 @@ VkPipeline get_or_create_specialized_graphics_pipeline(MtlRenderPipelineStateImp
     /* VK_KHR_maintenance1 negative viewport height maps Metal NDC (+Y up) to Vulkan framebuffer (+Y down)
        identically to Metal, preserving screen-space CW/CCW winding. */
     rs.frontFace = (front_winding == kMTLWindingCW) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.depthClampEnable = (depth_clip_mode == 1 && st.vk_ctx.caps().supported_features.depthClamp) ? VK_TRUE : VK_FALSE;
     rs.lineWidth = 1.0f;
     rs.depthBiasEnable = VK_TRUE;
 

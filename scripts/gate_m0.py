@@ -171,8 +171,12 @@ def check_docs() -> list[tuple[str, bool, str]]:
     return results
 
 
+ALLOWED_ROOT_MDS = {"readme.md", "contributing.md", "changelog.md", "security.md"}
+
+
 def check_no_md_outside_docs() -> tuple[bool, str]:
     docs_real = os.path.normcase(os.path.realpath(DOCS_DIR))
+    repo_real = os.path.normcase(os.path.realpath(REPO_ROOT))
     violations = []
     for root, dirs, files in os.walk(REPO_ROOT):
         # Skip .git directory
@@ -180,11 +184,14 @@ def check_no_md_outside_docs() -> tuple[bool, str]:
         for fname in files:
             if fname.lower().endswith(".md"):
                 fpath = os.path.realpath(os.path.join(root, fname))
+                fdir = os.path.normcase(os.path.dirname(fpath))
+                if fdir == repo_real and fname.lower() in ALLOWED_ROOT_MDS:
+                    continue
                 if not os.path.normcase(fpath).startswith(docs_real + os.sep):
                     violations.append(os.path.relpath(fpath, REPO_ROOT))
     if violations:
         return False, f"Found .md file(s) outside docs/: {violations}"
-    return True, "Zero .md files outside docs/"
+    return True, "Zero stray .md files outside docs/ (standard root GitHub docs allowed)"
 
 
 def main() -> int:

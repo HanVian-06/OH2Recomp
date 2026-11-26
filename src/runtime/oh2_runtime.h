@@ -44,6 +44,7 @@ void  oh2_ui_set_active_ios_view(void *view);
 void *oh2_ui_get_active_window(void);
 void  oh2_cadisplaylink_set_vsync_driven(int enable);
 void  oh2_cadisplaylink_tick_all(double timestamp_sec, double target_timestamp_sec);
+int   oh2_cadisplaylink_get_target_fps(void);
 
 /* NSSet object container helpers (used by UITouch / UIEvent in M5) */
 void  *oh2_objc_set_create(void *const *items, size_t count);

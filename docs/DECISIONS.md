@@ -80,3 +80,12 @@
   1. Translate `MTLColorWriteMask` bit-for-bit (`0x8 -> R`, `0x4 -> G`, `0x2 -> B`, `0x1 -> A`) and implement deep-copy `init`, `copy`, `copyWithZone:`, `reset`, and `setObject:atIndexedSubscript:` on all Metal descriptor classes.
   2. Chain `ANativeActivityCallbacks` (`onWindowFocusChanged`, `onResume`, `onNativeWindowCreated`) on the Android main UI thread to enforce sticky immersive fullscreen (`WindowInsetsController.hide(7)` + `BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE` + `setSystemUiVisibility(0x1706)`), and pause/flush the `AAudio` stream whenever the activity loses focus or backgrounds.
 - **Consequences**: Eliminates solid black/white boxes around UI elements/fonts, prevents accidental navigation-bar exits during touch gameplay, and stops audio immediately when backgrounding the app.
+
+
+## D15: Standalone On-Device C++17 AIR 2.0 Compiler & Clean Asset-Free Release APK
+- **Decision**: Move AIR 2.0 → SPIR-V 1.3 shader compilation from offline PC-only Python scripts into a native C++17 library (`src/air2spirv_cpp/`) invoked from the Arcadian Android Launcher after the user imports their own decrypted `.ipa`.
+- **Rationale**: Keeps the open-source repository and Release APKs 100% free of copyrighted game assets/binaries while achieving ~3-second multi-threaded on-device compilation of all 4,544 shaders.
+
+## D16: Vector `air.convert.f.v*` Support & Metal-to-Vulkan Frame-Pacing / Resource Pooling
+- **Decision**: Implement vector float/int conversion intrinsics (`air.convert.f.v*`) in both C++17 and Python AIR translators; replace per-pass CPU buffer-texture hashing with GPU-preamble DMA (`slot.preamble_cmd`); pool `MTLBuffer` allocations (`4 KiB..1 MiB`), `fb_fetch` snapshot images by `(w, h, fmt, occ)`, and per-`(level, slice)` attachment `VkImageView`s; and lock `CADisplayLink` directly to hardware `AChoreographer` VSync timestamps with big-core affinity for UE4 threads.
+- **Consequences**: Fixes outdoor CSM shadow cascade corruption while eliminating per-frame `vmaCreateImage`/`vkResetDescriptorPool` thrashing (`drst` 180 → 0..4), CPU buffer-texture readback stalls (~21 ms/frame), and open-loop VSync phase drift.

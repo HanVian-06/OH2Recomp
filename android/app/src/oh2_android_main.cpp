@@ -374,6 +374,71 @@ static void handle_cmd(struct android_app *app, int32_t cmd) {
     }
 }
 
+static void ensure_dir_recursive(const std::string &path) {
+    for (size_t i = 1; i < path.size(); ++i) {
+        if (path[i] == '/') {
+            mkdir(path.substr(0, i).c_str(), 0755);
+        }
+    }
+    mkdir(path.c_str(), 0755);
+}
+
+static void ensure_android_ue4_config(const std::string &bundle_root) {
+    /*
+     * Write optimal UE4 iOS Shipping override in Saved/Config/IOS/:
+     * - r.NumBufferedOcclusionQueries=1 eliminates synchronous RenderThread/GPU stall
+     *   while keeping iOS-native shadow distance & CSM culling for rock-solid FPS.
+     */
+    std::string cfg_dir = bundle_root + "/Documents/OH2/Saved/Config/IOS";
+    ensure_dir_recursive(cfg_dir);
+
+    const std::string dp_path = cfg_dir + "/DeviceProfiles.ini";
+    if (FILE *dp = std::fopen(dp_path.c_str(), "wb")) {
+        static const char kDpIni[] =
+            "[IOS DeviceProfile]\n"
+            "-CVars=r.Shadow.MaxCSMResolution=2048\n"
+            "-CVars=r.DepthOfFieldQuality=1\n"
+            "+CVars=r.NumBufferedOcclusionQueries=1\n"
+            "+CVars=r.NeverOcclusionTestDistance=2500\n"
+            "+CVars=r.ExpandAllOcclusionTestedBBoxesAmount=50\n"
+            "+CVars=r.ScaleAllTestedBBoxesAmount=1.1\n"
+            "+CVars=r.Shadow.MaxCSMResolution=1024\n"
+            "+CVars=r.DepthOfFieldQuality=0\n"
+            "\n"
+            "[iPhoneXR DeviceProfile]\n"
+            "+CVars=r.NumBufferedOcclusionQueries=1\n"
+            "+CVars=r.NeverOcclusionTestDistance=2500\n"
+            "+CVars=r.ExpandAllOcclusionTestedBBoxesAmount=50\n"
+            "+CVars=r.ScaleAllTestedBBoxesAmount=1.1\n"
+            "+CVars=r.Shadow.MaxCSMResolution=1024\n"
+            "+CVars=r.DepthOfFieldQuality=0\n"
+            "\n"
+            "[iPhone11 DeviceProfile]\n"
+            "+CVars=r.NumBufferedOcclusionQueries=1\n"
+            "+CVars=r.NeverOcclusionTestDistance=2500\n"
+            "+CVars=r.ExpandAllOcclusionTestedBBoxesAmount=50\n"
+            "+CVars=r.ScaleAllTestedBBoxesAmount=1.1\n"
+            "+CVars=r.Shadow.MaxCSMResolution=1024\n"
+            "+CVars=r.DepthOfFieldQuality=0\n";
+        std::fwrite(kDpIni, 1, sizeof(kDpIni) - 1, dp);
+        std::fclose(dp);
+    }
+
+    const std::string eng_path = cfg_dir + "/Engine.ini";
+    if (FILE *eng = std::fopen(eng_path.c_str(), "wb")) {
+        static const char kEngIni[] =
+            "[ConsoleVariables]\n"
+            "r.NumBufferedOcclusionQueries=1\n"
+            "r.NeverOcclusionTestDistance=2500\n"
+            "r.ExpandAllOcclusionTestedBBoxesAmount=50\n"
+            "r.ScaleAllTestedBBoxesAmount=1.1\n"
+            "r.Shadow.MaxCSMResolution=1024\n"
+            "r.DepthOfFieldQuality=0\n";
+        std::fwrite(kEngIni, 1, sizeof(kEngIni) - 1, eng);
+        std::fclose(eng);
+    }
+}
+
 static int32_t handle_input(struct android_app *app, AInputEvent *event) {
     (void)app;
     return oh2_platform_handle_input_event(event);
@@ -382,6 +447,7 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
 } // namespace
 
 void android_main(struct android_app *app) {
+    oh2_darwin_pthread_setname_np("OH2_AndroidMain");
     if (app && app->activity) {
         ANativeActivity_setWindowFlags(app->activity, AWINDOW_FLAG_FULLSCREEN | AWINDOW_FLAG_KEEP_SCREEN_ON, 0);
         if (app->activity->callbacks) {
@@ -396,14 +462,10 @@ void android_main(struct android_app *app) {
     g_app_state.app = app;
     g_app_state.bundle_root = "/sdcard/Android/data/com.oceanhorn2.port/files";
     if (app->activity && app->activity->externalDataPath && app->activity->externalDataPath[0]) {
-        struct stat st_dir{};
-        std::string ext = app->activity->externalDataPath;
-        if (stat((ext + "/cookeddata/oh2/content/paks/oh2-ios.pak").c_str(), &st_dir) == 0 ||
-            stat((ext + "/.oh2_test").c_str(), &st_dir) == 0) {
-            g_app_state.bundle_root = ext;
-        }
+        g_app_state.bundle_root = app->activity->externalDataPath;
     }
     g_app_state.spirv_cache_path = g_app_state.bundle_root + "/spirv_cache.bin";
+    ensure_android_ue4_config(g_app_state.bundle_root);
 
     app->userData = &g_app_state;
     app->onAppCmd = handle_cmd;
@@ -412,7 +474,7 @@ void android_main(struct android_app *app) {
     int events = 0;
     struct android_poll_source *source = nullptr;
     while (!app->destroyRequested) {
-        while (ALooper_pollOnce(16, nullptr, &events, (void **)&source) >= 0) {
+        while (ALooper_pollOnce(-1, nullptr, &events, (void **)&source) >= 0) {
             if (source) source->process(app, source);
             if (app->destroyRequested) break;
         }

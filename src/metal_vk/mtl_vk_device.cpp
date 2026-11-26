@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <dlfcn.h>
 #include <sched.h>
 #include <sys/resource.h>
@@ -32,15 +33,23 @@ static std::string nsstr_to_std(const void *obj) {
     return s;
 }
 
-/* Dynamically loaded Android ADPF (APerformanceHintManager, API 33+) + big-core affinity for RenderThread */
+/* Dynamically loaded Android ADPF (APerformanceHintManager, API 33+) + ANativeWindow_setFrameRate (API 30+)
+   + big-core affinity for RenderThread, dynamically synced to 30 FPS vs 60 FPS target to prevent thermal throttling. */
 struct AdpfHelper {
-    using GetMgrFn    = void *(*)(void);
-    using CreateSesFn = void *(*)(void *, const int32_t *, size_t, int64_t);
-    using ReportFn    = int (*)(void *, int64_t);
+    using GetMgrFn       = void *(*)(void);
+    using CreateSesFn    = void *(*)(void *, const int32_t *, size_t, int64_t);
+    using ReportFn       = int (*)(void *, int64_t);
+    using UpdateTargetFn = int (*)(void *, int64_t);
+    using SetFrameRateFn = int32_t (*)(ANativeWindow *, float, int8_t);
 
-    void       *session = nullptr;
-    ReportFn    report_fn = nullptr;
-    pid_t       boosted_tid = 0;
+    void          *session = nullptr;
+    ReportFn       report_fn = nullptr;
+    UpdateTargetFn update_target_fn = nullptr;
+    SetFrameRateFn set_frame_rate_fn = nullptr;
+    pid_t          boosted_tid = 0;
+    int            last_target_fps = 0;
+    ANativeWindow *last_rate_win = nullptr;
+    uint64_t       frame_accum_work_ns = 0;
 
     void boost_render_thread_once() {
         pid_t tid = gettid();
@@ -81,24 +90,49 @@ struct AdpfHelper {
         }
         setpriority(PRIO_PROCESS, 0, -8);
 
-        /* 2. Register RenderThread with Android Performance Hint Manager (ADPF) targeting 16.6ms (60 FPS) */
+        /* 2. Register RenderThread with Android Performance Hint Manager (ADPF) + ANativeWindow_setFrameRate */
         void *lib = dlopen("libandroid.so", RTLD_LAZY | RTLD_LOCAL);
         if (lib) {
             auto get_mgr = reinterpret_cast<GetMgrFn>(dlsym(lib, "APerformanceHint_getManager"));
             auto create_ses = reinterpret_cast<CreateSesFn>(dlsym(lib, "APerformanceHint_createSession"));
             report_fn = reinterpret_cast<ReportFn>(dlsym(lib, "APerformanceHint_reportActualWorkDuration"));
+            update_target_fn = reinterpret_cast<UpdateTargetFn>(dlsym(lib, "APerformanceHint_updateTargetWorkDuration"));
+            set_frame_rate_fn = reinterpret_cast<SetFrameRateFn>(dlsym(lib, "ANativeWindow_setFrameRate"));
             if (get_mgr && create_ses && report_fn) {
                 void *mgr = get_mgr();
                 if (mgr) {
                     int32_t tids[1] = {static_cast<int32_t>(tid)};
+                    /* Always use 16.67ms ADPF target ("race-to-idle"): in 30 FPS mode CADisplayLink ticks
+                       only every 33.33ms so finishing work fast and entering deep idle prevents clock oscillation! */
                     session = create_ses(mgr, tids, 1, 16666667LL);
+                    last_target_fps = 60;
                 }
             }
         }
-        MTLVK_LOGI("[M5] RenderThread tid=%d boosted: big_cores=%d/%d (freq %llu..%llu kHz) adpf=%d",
+        MTLVK_LOGI("[M5] RenderThread tid=%d boosted: big_cores=%d/%d (freq %llu..%llu kHz) adpf=%d setFrameRate=%d",
                    (int)tid, big_cnt, ncpus,
                    (unsigned long long)min_f, (unsigned long long)max_f,
-                   session ? 1 : 0);
+                   session ? 1 : 0, set_frame_rate_fn ? 1 : 0);
+    }
+
+    void sync_target_fps(ANativeWindow *win, int target_fps) {
+        if (target_fps <= 0 || target_fps > 120) target_fps = 60;
+        const int norm_fps = (target_fps <= 30) ? 30 : 60;
+        if (norm_fps != last_target_fps) {
+            last_target_fps = norm_fps;
+            if (session && update_target_fn) {
+                update_target_fn(session, 16666667LL);
+            }
+            if (win && set_frame_rate_fn) {
+                set_frame_rate_fn(win, 60.0f, 1);
+                last_rate_win = win;
+            }
+            MTLVK_LOGI("[M5] FramePacer synced: target=%d FPS (ADPF=16ms race-to-idle, SurfaceFlinger=60Hz)",
+                       norm_fps);
+        } else if (win && win != last_rate_win && set_frame_rate_fn) {
+            set_frame_rate_fn(win, 60.0f, 1);
+            last_rate_win = win;
+        }
     }
 
     void report_work_ns(int64_t ns) {
@@ -142,11 +176,12 @@ void *alloc_mtl_wrap_managed(const char *cls_name, void *impl_ptr, void (*deallo
 
 VkDescriptorPool create_frame_descriptor_pool(VkDevice dev) {
     VkDescriptorPoolSize sizes[] = {
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32768},
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  32768},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  4096},
-        {VK_DESCRIPTOR_TYPE_SAMPLER,        16384},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         32768},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 32768},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         32768},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          32768},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           4096},
+        {VK_DESCRIPTOR_TYPE_SAMPLER,                16384},
     };
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = 16384;
@@ -160,7 +195,12 @@ VkDescriptorPool create_frame_descriptor_pool(VkDevice dev) {
     return pool;
 }
 
-void enqueue_deferred_buffer(VkBuffer buf, VmaAllocation alloc) {
+uint64_t next_mtl_resource_uid() {
+    static std::atomic<uint64_t> s_uid{100ULL};
+    return s_uid.fetch_add(1, std::memory_order_relaxed);
+}
+
+void enqueue_deferred_buffer(VkBuffer buf, VmaAllocation alloc, void *mapped, uint64_t capacity) {
     if (buf == VK_NULL_HANDLE && alloc == VK_NULL_HANDLE) return;
     MtlVkState &st = get_state();
     std::lock_guard<std::mutex> lk(st.mutex);
@@ -168,6 +208,8 @@ void enqueue_deferred_buffer(VkBuffer buf, VmaAllocation alloc) {
     d.kind = DeferredDestroy::BUFFER;
     d.buffer = buf;
     d.allocation = alloc;
+    d.mapped = mapped;
+    d.capacity = capacity;
     d.frames_remaining = kMaxFramesInFlight + 1;
     st.deferred_destroys.push_back(d);
 }
@@ -210,6 +252,7 @@ void enqueue_deferred_framebuffer(VkFramebuffer fb) {
 void enqueue_deferred_sampler(VkSampler smp) {
     if (smp == VK_NULL_HANDLE) return;
     MtlVkState &st = get_state();
+    st.desc_resource_gen.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(st.mutex);
     DeferredDestroy d{};
     d.kind = DeferredDestroy::SAMPLER;
@@ -243,6 +286,21 @@ void tick_deferred_destroys(bool force_all) {
     for (const DeferredDestroy &d : ready) {
         switch (d.kind) {
             case DeferredDestroy::BUFFER:
+                if (!force_all && d.buffer != VK_NULL_HANDLE && d.mapped != nullptr && d.capacity >= 4096ULL && d.capacity <= 1048576ULL) {
+                    int bi = (d.capacity <= 4096ULL) ? 0 :
+                             (d.capacity <= 16384ULL) ? 1 :
+                             (d.capacity <= 65536ULL) ? 2 :
+                             (d.capacity <= 262144ULL) ? 3 : 4;
+                    bool recycled = false;
+                    {
+                        std::lock_guard<std::mutex> lk(st.mutex);
+                        if (st.buffer_pool[bi].size() < 32u) {
+                            st.buffer_pool[bi].push_back({d.buffer, d.allocation, d.mapped, d.capacity});
+                            recycled = true;
+                        }
+                    }
+                    if (recycled) break;
+                }
                 if (d.buffer != VK_NULL_HANDLE || d.allocation != VK_NULL_HANDLE) {
                     vmaDestroyBuffer(alloc, d.buffer, d.allocation);
                 }
@@ -577,21 +635,30 @@ VkCommandBuffer mtl_begin_command_buffer_internal(MtlCommandBufferImpl *cb) {
     tick_deferred_destroys(false);
     vkResetFences(dev, 1, &slot.in_flight_fence);
     vkResetCommandPool(dev, slot.cmd_pool, 0);
-    vkResetDescriptorPool(dev, slot.desc_pool, 0);
-    for (VkDescriptorPool p : slot.overflow_desc_pools) {
-        if (p != VK_NULL_HANDLE) vkResetDescriptorPool(dev, p, 0);
-    }
-    slot.active_desc_pool_idx = 0;
-    slot.desc_cache_epoch++;
-    if (slot.desc_cache_epoch == 0) {
-        std::memset(slot.desc_cache, 0, sizeof(slot.desc_cache));
-        slot.desc_cache_epoch = 1;
+    /* Persistent per-slot descriptor cache: only reset descriptor pool when a sampled resource was
+       destroyed or the pool nears capacity (eliminates ~1,000 vkAllocate/vkUpdateDescriptorSets/frame!). */
+    const uint64_t cur_rgen = st.desc_resource_gen.load(std::memory_order_relaxed);
+    if (slot.desc_pool_resource_gen != cur_rgen || slot.desc_sets_allocated > 12000u) {
+        vkResetDescriptorPool(dev, slot.desc_pool, 0);
+        for (VkDescriptorPool p : slot.overflow_desc_pools) {
+            if (p != VK_NULL_HANDLE) vkResetDescriptorPool(dev, p, 0);
+        }
+        slot.active_desc_pool_idx = 0;
+        slot.desc_sets_allocated = 0;
+        slot.desc_pool_resource_gen = cur_rgen;
+        st.prof_desc_resets.fetch_add(1, std::memory_order_relaxed);
+        slot.desc_cache_epoch++;
+        if (slot.desc_cache_epoch == 0) {
+            std::memset(slot.desc_cache, 0, sizeof(slot.desc_cache));
+            slot.desc_cache_epoch = 1;
+        }
     }
     slot.inline_cursor = 0;
     slot.staging_end_cursor = 0;
     slot.occ_query_cursor = 0;
     slot.ts_query_cursor = 0;
     slot.ts_passes.clear();
+    slot.preamble_btex_list.clear();
     slot.ts_capturing = false;
 
     VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -606,18 +673,40 @@ VkCommandBuffer mtl_begin_command_buffer_internal(MtlCommandBufferImpl *cb) {
         vkCmdResetQueryPool(slot.cmd, slot.ts_query_pool, 0, kMaxTimestampQueriesPerCB);
         vkCmdWriteTimestamp(slot.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, slot.ts_query_pool, slot.ts_query_cursor++);
     }
-    /* Synchronize GPU execution and caches across consecutive VkCommandBuffers on graphics_queue()
-       so prior command buffers' render passes, blits, and compute dispatches complete before this
-       command buffer reads or renders into shared attachments and buffers. */
+    /* Synchronize GPU writes from prior command buffers on graphics_queue() with targeted stages
+       (avoids full TOP_OF_PIPE/ALL_COMMANDS frontend drain while guaranteeing cache coherency). */
     VkMemoryBarrier init_mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    init_mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    init_mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    init_mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_SHADER_WRITE_BIT |
+                            VK_ACCESS_TRANSFER_WRITE_BIT;
+    init_mb.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+                            VK_ACCESS_INDEX_READ_BIT |
+                            VK_ACCESS_UNIFORM_READ_BIT |
+                            VK_ACCESS_SHADER_READ_BIT |
+                            VK_ACCESS_SHADER_WRITE_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_TRANSFER_READ_BIT |
+                            VK_ACCESS_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier(slot.cmd,
-                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 1, &init_mb, 0, nullptr, 0, nullptr);
     static std::atomic<uint64_t> s_cmd_seq_gen{1};
     cb->frame_idx = fidx;
+    cb->fb_snap_seq = 0;
     cb->cmd_seq_id = s_cmd_seq_gen.fetch_add(1, std::memory_order_relaxed);
     cb->begin_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                        std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -660,7 +749,12 @@ bool mtl_acquire_swapchain_image_internal(MtlMetalLayerImpl *layer, uint32_t *ou
     if (!st.initialized || !out_sc_idx || !out_wait_sem) return false;
 
     VkDevice dev = st.vk_ctx.device();
-    /* Drain oldest in-flight frame first so recycled acquire semaphore is guaranteed idle on GPU */
+    /* Bound GPU present queue depth to at most 2 in-flight frames (eliminates 3-4 frame latency/pileup) */
+    uint32_t old_pres_fidx = st.present_ring_fidx[st.present_ring_pos];
+    if (old_pres_fidx < kMaxFramesInFlight) {
+        wait_slot_idle(st, old_pres_fidx);
+    }
+    /* Drain oldest in-flight slot if needed so recycled acquire semaphore is guaranteed idle on GPU */
     uint32_t fidx = st.next_frame_idx;
     wait_slot_idle(st, fidx);
     tick_deferred_destroys(false);
@@ -793,6 +887,7 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
     cb->committed = true;
     cb->status = 2; /* Committed */
 
+    const bool has_preamble = mtl_record_preamble_btex_copies(cb);
     if (slot.inline_cursor > 0 && slot.inline_alloc != VK_NULL_HANDLE) {
         vmaFlushAllocation(st.vk_ctx.allocator(), slot.inline_alloc, 0, slot.inline_cursor);
     }
@@ -807,12 +902,13 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
         signal_count = 1;
     }
 
+    VkCommandBuffer submit_cmds[2] = {has_preamble ? slot.preamble_cmd : cb->cmd, cb->cmd};
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.waitSemaphoreCount = wait_count;
     submit.pWaitSemaphores = wait_count ? wait_sems : nullptr;
     submit.pWaitDstStageMask = wait_count ? wait_stages : nullptr;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cb->cmd;
+    submit.commandBufferCount = has_preamble ? 2u : 1u;
+    submit.pCommandBuffers = submit_cmds;
     submit.signalSemaphoreCount = signal_count;
     submit.pSignalSemaphores = signal_count ? signal_sems : nullptr;
 
@@ -824,6 +920,11 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
 
     uint64_t submit_now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (cb->begin_ns > 0 && submit_now_ns > cb->begin_ns) {
+        uint64_t cb_rec_ns = submit_now_ns - cb->begin_ns;
+        st.prof_cb_rec_us.fetch_add(cb_rec_ns / 1000ULL, std::memory_order_relaxed);
+        g_adpf.frame_accum_work_ns += cb_rec_ns;
+    }
     VkResult qres = VK_SUCCESS;
     {
         auto t_sub0 = std::chrono::steady_clock::now();
@@ -858,9 +959,14 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
     }
 
     if (do_present && signal_count == 1) {
-        if (cb->begin_ns > 0 && submit_now_ns > cb->begin_ns) {
-            g_adpf.report_work_ns(static_cast<int64_t>(submit_now_ns - cb->begin_ns));
+        const int target_fps = oh2_cadisplaylink_get_target_fps();
+        g_adpf.sync_target_fps(st.current_window, target_fps);
+        if (g_adpf.frame_accum_work_ns > 0) {
+            g_adpf.report_work_ns(static_cast<int64_t>(g_adpf.frame_accum_work_ns));
+            g_adpf.frame_accum_work_ns = 0;
         }
+        st.present_ring_fidx[st.present_ring_pos] = cb->frame_idx;
+        st.present_ring_pos = (st.present_ring_pos + 1u) & 1u;
         VkSwapchainKHR sc = st.vk_ctx.swapchain();
         VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         present.waitSemaphoreCount = 1;
@@ -923,12 +1029,20 @@ bool mtl_commit_command_buffer_internal(void *cb_obj, bool wait_completed) {
                 s_prev_iu_us += d_iu; s_prev_iu_cnt += d_ic;
                 s_prev_dh += d_dh; s_prev_dm += d_dm;
                 if (pcount >= 60 && dt_ms > 1.0) {
-                    MTLVK_LOGI("[M5] Prof60: fps=%.1f frame=%.1fms draws/f=%.1f rp/f=%.1f fb_snap/f=%.1f occ/f=%.1f btex/f=%.1f dcache=%.0f/%.0f imm=%.1f(%.1fms) acq/f=%.1fms",
-                               60000.0 / dt_ms, dt_ms / 60.0, (double)(d_dr + d_id) / 60.0,
+                    static uint64_t s_prev_gf = 0, s_prev_rec = 0, s_prev_drst = 0;
+                    uint64_t d_gf = st.prof_gpu_fence_us.load(std::memory_order_relaxed) - s_prev_gf;
+                    uint64_t d_rec = st.prof_cb_rec_us.load(std::memory_order_relaxed) - s_prev_rec;
+                    uint64_t d_drst = st.prof_desc_resets.load(std::memory_order_relaxed) - s_prev_drst;
+                    s_prev_gf += d_gf;
+                    s_prev_rec += d_rec;
+                    s_prev_drst += d_drst;
+                    MTLVK_LOGI("[M5] Prof60: fps=%.1f frame=%.1fms rec=%.1fms draws/f=%.1f rp/f=%.1f fb_snap/f=%.1f occ/f=%.1f btex/f=%.1f dcache=%.0f/%.0f drst=%llu wait=%.1f",
+                               60000.0 / dt_ms, dt_ms / 60.0, (double)d_rec / 60000.0,
+                               (double)(d_dr + d_id) / 60.0,
                                (double)d_rp / 60.0, (double)d_fb / 60.0, (double)d_oc / 60.0,
                                (double)d_bt / 60.0, (double)d_dh / 60.0, (double)(d_dh + d_dm) / 60.0,
-                               (double)d_ic / 60.0, (double)d_iu / 60000.0,
-                               (double)d_aq / 60000.0);
+                               (unsigned long long)d_drst,
+                               (double)d_wt / 60000.0);
                 }
             }
         } else {
@@ -1070,6 +1184,7 @@ bool create_per_swapchain_sync(MtlVkState &st) {
             tex = unwrap_mtl<MtlTextureImpl>(st.swapchain_tex_objs[i]);
         }
         tex->image = st.use_virtual_drawable ? st.virtual_drawable_images[i] : imgs[i];
+        tex->unique_id = next_mtl_resource_uid();
         tex->view = st.use_virtual_drawable ? st.virtual_drawable_views[i] : ((i < views.size()) ? views[i] : VK_NULL_HANDLE);
         tex->vk_format = sc_fmt;
         tex->mtl_pixel_format = mtl_fmt;
@@ -1935,8 +2050,38 @@ int mtl_vk_init(ANativeWindow *window, const char *spirv_cache_path, int enable_
     }
 
     VkDevice dev = st.vk_ctx.device();
+    std::vector<uint8_t> disk_pcache;
+    {
+        const char *broot = oh2_objc_get_bundle_root();
+        if (broot && broot[0]) {
+            std::string ppath = std::string(broot) + "/vk_pipeline_cache.bin";
+            FILE *fp = std::fopen(ppath.c_str(), "rb");
+            if (fp) {
+                std::fseek(fp, 0, SEEK_END);
+                long sz = std::ftell(fp);
+                std::fseek(fp, 0, SEEK_SET);
+                if (sz > 16 && sz < 64 * 1024 * 1024) {
+                    disk_pcache.resize((size_t)sz);
+                    if (std::fread(disk_pcache.data(), 1, (size_t)sz, fp) != (size_t)sz) {
+                        disk_pcache.clear();
+                    }
+                }
+                std::fclose(fp);
+            }
+        }
+    }
     VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-    vkCreatePipelineCache(dev, &pci, nullptr, &st.pipeline_cache);
+    if (!disk_pcache.empty()) {
+        pci.initialDataSize = disk_pcache.size();
+        pci.pInitialData = disk_pcache.data();
+    }
+    if (vkCreatePipelineCache(dev, &pci, nullptr, &st.pipeline_cache) != VK_SUCCESS && !disk_pcache.empty()) {
+        pci.initialDataSize = 0;
+        pci.pInitialData = nullptr;
+        vkCreatePipelineCache(dev, &pci, nullptr, &st.pipeline_cache);
+    } else if (!disk_pcache.empty()) {
+        MTLVK_LOGI("Loaded persistent VkPipelineCache (%zu bytes)", disk_pcache.size());
+    }
 
     VkCommandPoolCreateInfo up_pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     up_pool.queueFamilyIndex = st.vk_ctx.graphics_queue_family();
@@ -1948,6 +2093,14 @@ int mtl_vk_init(ANativeWindow *window, const char *spirv_cache_path, int enable_
     VkPhysicalDeviceProperties pdp{};
     vkGetPhysicalDeviceProperties(st.vk_ctx.physical_device(), &pdp);
     st.timestamp_period_ns = (pdp.limits.timestampPeriod > 0.0f) ? pdp.limits.timestampPeriod : 1.0f;
+    st.max_dyn_ubo_per_stage = std::min<uint32_t>(8u, pdp.limits.maxDescriptorSetUniformBuffersDynamic / 2u);
+    st.min_ubo_offset_align = std::max<uint64_t>(1ULL, pdp.limits.minUniformBufferOffsetAlignment);
+    MTLVK_LOGI("[M5] GPU limits: maxDynUBO=%u (perStage=%u) maxDynSSBO=%u minUboAlign=%llu tsPeriod=%.2fns",
+               pdp.limits.maxDescriptorSetUniformBuffersDynamic,
+               st.max_dyn_ubo_per_stage,
+               pdp.limits.maxDescriptorSetStorageBuffersDynamic,
+               (unsigned long long)st.min_ubo_offset_align,
+               st.timestamp_period_ns);
 
     for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
         FrameSyncSlot &f = st.frames[i];
@@ -1959,8 +2112,11 @@ int mtl_vk_init(ANativeWindow *window, const char *spirv_cache_path, int enable_
         VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         cbai.commandPool = f.cmd_pool;
         cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbai.commandBufferCount = 1;
-        if (vkAllocateCommandBuffers(dev, &cbai, &f.cmd) != VK_SUCCESS) return -1;
+        cbai.commandBufferCount = 2;
+        VkCommandBuffer cmds[2]{};
+        if (vkAllocateCommandBuffers(dev, &cbai, cmds) != VK_SUCCESS) return -1;
+        f.cmd = cmds[0];
+        f.preamble_cmd = cmds[1];
 
         f.desc_pool = create_frame_descriptor_pool(dev);
         if (f.desc_pool == VK_NULL_HANDLE) return -1;
@@ -1992,7 +2148,7 @@ int mtl_vk_init(ANativeWindow *window, const char *spirv_cache_path, int enable_
         if (vkCreateFence(dev, &fi, nullptr, &f.in_flight_fence) != VK_SUCCESS) return -1;
         f.submitted = false;
 
-        f.inline_capacity = 32ULL * 1024ULL * 1024ULL;
+        f.inline_capacity = 8ULL * 1024ULL * 1024ULL;
         VkBufferCreateInfo ibci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         ibci.size = f.inline_capacity;
         ibci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -2068,6 +2224,14 @@ void mtl_vk_pause_surface(void) {
         vkDeviceWaitIdle(dev);
     }
     tick_deferred_destroys(true);
+    for (int bi = 0; bi < 5; ++bi) {
+        for (const auto &pb : st.buffer_pool[bi]) {
+            if (pb.buffer != VK_NULL_HANDLE || pb.allocation != VK_NULL_HANDLE) {
+                vmaDestroyBuffer(st.vk_ctx.allocator(), pb.buffer, pb.allocation);
+            }
+        }
+        st.buffer_pool[bi].clear();
+    }
     st.vk_ctx.release_surface();
     st.current_window = nullptr;
     if (st.shared_layer_obj) {
@@ -2110,6 +2274,14 @@ int mtl_vk_set_surface(ANativeWindow *window) {
             vkDeviceWaitIdle(dev);
         }
         tick_deferred_destroys(true);
+    for (int bi = 0; bi < 5; ++bi) {
+        for (const auto &pb : st.buffer_pool[bi]) {
+            if (pb.buffer != VK_NULL_HANDLE || pb.allocation != VK_NULL_HANDLE) {
+                vmaDestroyBuffer(st.vk_ctx.allocator(), pb.buffer, pb.allocation);
+            }
+        }
+        st.buffer_pool[bi].clear();
+    }
         if (!st.vk_ctx.rebind_surface(window)) {
             MTLVK_LOGE("VkContext::rebind_surface failed");
             return -1;
@@ -2160,6 +2332,14 @@ void mtl_vk_shutdown(void) {
         vkDeviceWaitIdle(dev);
     }
     tick_deferred_destroys(true);
+    for (int bi = 0; bi < 5; ++bi) {
+        for (const auto &pb : st.buffer_pool[bi]) {
+            if (pb.buffer != VK_NULL_HANDLE || pb.allocation != VK_NULL_HANDLE) {
+                vmaDestroyBuffer(st.vk_ctx.allocator(), pb.buffer, pb.allocation);
+            }
+        }
+        st.buffer_pool[bi].clear();
+    }
 
     for (auto &kv : st.shader_modules) {
         if (kv.second != VK_NULL_HANDLE) vkDestroyShaderModule(dev, kv.second, nullptr);
@@ -2177,18 +2357,11 @@ void mtl_vk_shutdown(void) {
     if (st.dummy_depth_image != VK_NULL_HANDLE) vmaDestroyImage(st.vk_ctx.allocator(), st.dummy_depth_image, st.dummy_depth_alloc);
     if (st.dummy_sampler != VK_NULL_HANDLE) vkDestroySampler(dev, st.dummy_sampler, nullptr);
     if (st.dummy_buffer != VK_NULL_HANDLE) vmaDestroyBuffer(st.vk_ctx.allocator(), st.dummy_buffer, st.dummy_buffer_alloc);
-    if (st.fb_fetch_view != VK_NULL_HANDLE) {
-        vkDestroyImageView(dev, st.fb_fetch_view, nullptr);
-        st.fb_fetch_view = VK_NULL_HANDLE;
+    for (auto &fe : st.fb_fetch_pool) {
+        if (fe.view != VK_NULL_HANDLE) vkDestroyImageView(dev, fe.view, nullptr);
+        if (fe.image != VK_NULL_HANDLE) vmaDestroyImage(st.vk_ctx.allocator(), fe.image, fe.alloc);
     }
-    if (st.fb_fetch_image != VK_NULL_HANDLE) {
-        vmaDestroyImage(st.vk_ctx.allocator(), st.fb_fetch_image, st.fb_fetch_alloc);
-        st.fb_fetch_image = VK_NULL_HANDLE;
-        st.fb_fetch_alloc = VK_NULL_HANDLE;
-    }
-    st.fb_fetch_w = 0;
-    st.fb_fetch_h = 0;
-    st.fb_fetch_fmt = VK_FORMAT_UNDEFINED;
+    st.fb_fetch_pool.clear();
 
     for (VkSemaphore s : st.render_finished_sems) {
         if (s != VK_NULL_HANDLE) vkDestroySemaphore(dev, s, nullptr);
@@ -2239,7 +2412,32 @@ void mtl_vk_shutdown(void) {
 
     if (st.upload_fence != VK_NULL_HANDLE) vkDestroyFence(dev, st.upload_fence, nullptr);
     if (st.upload_pool != VK_NULL_HANDLE) vkDestroyCommandPool(dev, st.upload_pool, nullptr);
-    if (st.pipeline_cache != VK_NULL_HANDLE) vkDestroyPipelineCache(dev, st.pipeline_cache, nullptr);
+    if (st.pipeline_cache != VK_NULL_HANDLE) {
+        const char *broot = oh2_objc_get_bundle_root();
+        if (broot && broot[0]) {
+            size_t pc_sz = 0;
+            if (vkGetPipelineCacheData(dev, st.pipeline_cache, &pc_sz, nullptr) == VK_SUCCESS && pc_sz > 16) {
+                std::vector<uint8_t> pc_data(pc_sz);
+                if (vkGetPipelineCacheData(dev, st.pipeline_cache, &pc_sz, pc_data.data()) == VK_SUCCESS && pc_sz > 16) {
+                    std::string ppath = std::string(broot) + "/vk_pipeline_cache.bin";
+                    std::string tpath = ppath + ".tmp";
+                    FILE *fp = std::fopen(tpath.c_str(), "wb");
+                    if (fp) {
+                        if (std::fwrite(pc_data.data(), 1, pc_sz, fp) == pc_sz) {
+                            std::fclose(fp);
+                            std::remove(ppath.c_str());
+                            std::rename(tpath.c_str(), ppath.c_str());
+                            MTLVK_LOGI("Saved persistent VkPipelineCache (%zu bytes)", pc_sz);
+                        } else {
+                            std::fclose(fp);
+                            std::remove(tpath.c_str());
+                        }
+                    }
+                }
+            }
+        }
+        vkDestroyPipelineCache(dev, st.pipeline_cache, nullptr);
+    }
 
     st.staging.destroy();
     st.vk_ctx.destroy();

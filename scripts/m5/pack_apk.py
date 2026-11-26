@@ -23,7 +23,12 @@ def make_android_align_extra(lfh_offset: int, name_len: int, align: int) -> byte
     return struct.pack("<HHH", 0xD935, 2 + zeros_len, align) + (b"\x00" * zeros_len)
 
 
-def write_stored_apk(out_path: str, base_apk: str, entries_16k: list[tuple[str, str]]) -> None:
+def write_stored_apk(
+    out_path: str,
+    base_apk: str,
+    entries_16k: list[tuple[str, str]],
+    entries_4b: list[tuple[str, str]] | None = None,
+) -> None:
     buf_items = []  # (name_bytes, compressed_bytes, uncomp_size, method, crc, mod_time, mod_date, align)
 
     with zipfile.ZipFile(base_apk, "r") as zbase:
@@ -40,6 +45,15 @@ def write_stored_apk(out_path: str, base_apk: str, entries_16k: list[tuple[str, 
                 comp = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15)
                 cdata = comp.compress(raw) + comp.flush()
                 buf_items.append((name_b, cdata, len(raw), 8, crc, dos_time, dos_date, 0))
+
+    for arc_name, disk_path in (entries_4b or []):
+        if not os.path.isfile(disk_path):
+            raise FileNotFoundError(f"Missing APK payload file: {disk_path}")
+        with open(disk_path, "rb") as f:
+            data = f.read()
+        name_b = arc_name.encode("utf-8")
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        buf_items.append((name_b, data, len(data), 0, crc, 0, 0x5421, 4))
 
     for arc_name, disk_path in entries_16k:
         if not os.path.isfile(disk_path):
@@ -124,18 +138,28 @@ def main() -> int:
     ap.add_argument("--base-apk", required=True)
     ap.add_argument("--out-apk", required=True)
     ap.add_argument("--app-so", required=True)
-    ap.add_argument("--val-so", required=True)
-    ap.add_argument("--macho", required=True)
+    ap.add_argument("--dex", default="", help="Optional classes.dex for Java LauncherActivity")
+    ap.add_argument("--val-so", default="", help="Optional Vulkan validation layer .so (dev mode)")
+    ap.add_argument("--macho", default="", help="Optional assets/oh2_macho.bin (dev mode only; omit for open-source release)")
     args = ap.parse_args()
+
+    entries_4b = []
+    if args.dex:
+        entries_4b.append(("classes.dex", args.dex))
+
+    entries_16k = [
+        ("lib/arm64-v8a/liboh2_android.so", args.app_so),
+    ]
+    if args.val_so:
+        entries_16k.append(("lib/arm64-v8a/libVkLayer_khronos_validation.so", args.val_so))
+    if args.macho:
+        entries_16k.append(("assets/oh2_macho.bin", args.macho))
 
     write_stored_apk(
         args.out_apk,
         args.base_apk,
-        [
-            ("lib/arm64-v8a/liboh2_android.so", args.app_so),
-            ("lib/arm64-v8a/libVkLayer_khronos_validation.so", args.val_so),
-            ("assets/oh2_macho.bin", args.macho),
-        ],
+        entries_16k,
+        entries_4b=entries_4b,
     )
     print(f"[pack_apk] Wrote 16KiB-aligned APK: {args.out_apk} ({os.path.getsize(args.out_apk)} bytes)")
     return 0

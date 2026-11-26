@@ -1,32 +1,73 @@
-# Read-only original iOS IPA payload (2.32 GB)
+# Read-only original iOS IPA payload & extracted game binaries (copyrighted — NEVER commit)
 Payload/
+*.ipa
+*.pak
+*.mtlb
+*.metallib
+oh2_macho.bin
+spirv_cache.bin
+vk_pipeline_cache.bin
 
-# Build & Gradle outputs
+# Build, CMake & Gradle outputs
 build/
+build_*/
+dist/
+out/
 .gradle/
+.cxx/
 android/**/build/
 android/**/.cxx/
 android/**/assets/shaders/
+CMakeCache.txt
+CMakeFiles/
+.ninja_deps
+.ninja_log
 *.apk
+*.apk.idsig
+*.idsig
 *.aab
 *.ap_
 *.dex
 *.spv
-spirv_cache.bin
+*.dSYM/
+
+# Keystores, signing secrets & local env
+*.keystore
+*.jks
+*.pem
+*.p12
+*.token
+.env
+.env.*
+scripts/env.local.ps1
+local.properties
 
 # Python & IDE
 __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.venv/
+venv/
 .idea/
 .vscode/
 
-# Temp & logs
+# Temp, logs & local captures
 *.tmp
 *.temp
 *.log
-local.properties
+*.mp4
+/*.png
+/*.jpg
+/*.jpeg
+scratch/
+.DS_Store
+Thumbs.db
+
+# Local scratch/e2e test harness
+scripts/e2e/
+scripts/run_e2e.ps1
+tests/
 
 # Downloaded archives (keep extracted verified libs if committed, ignore raw zips/aars)
 third_party/**/*.zip

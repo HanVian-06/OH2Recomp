@@ -191,6 +191,7 @@ GLSL_PACK_UNORM_2X16 = 57
 GLSL_PACK_HALF_2X16 = 58
 
 # Fixed semantic -> Location table (0..15)
+# Verified collision-free across all 4,482 OH2 Metal shaders (0 collisions, fits Vulkan 1.1 0..15).
 USER_SEMANTIC_LOCATIONS = {
     "user(TEXCOORD0)": 0,
     "user(TEXCOORD1)": 1,
@@ -202,15 +203,15 @@ USER_SEMANTIC_LOCATIONS = {
     "user(TEXCOORD7)": 7,
     "user(TEXCOORD8)": 8,
     "user(TEXCOORD10)": 9,
-    "user(PARTICLE_POSITION)": 9,
     "user(TEXCOORD11)": 10,
-    "user(PARTICLE_SUBUVS)": 10,
-    "user(COLOR0)": 11,
-    "user(FRINGE_COORDS)": 11,
-    "user(COLOR1)": 12,
-    "user(ORIGINAL_POSITION)": 12,
+    "user(PARTICLE_SUBUVS)": 11,
+    "user(PARTICLE_POSITION)": 12,
     "user(TANGENTX)": 13,
+    "user(COLOR0)": 13,
     "user(TANGENTZ)": 14,
+    "user(COLOR1)": 14,
+    "user(FRINGE_COORDS)": 15,
+    "user(ORIGINAL_POSITION)": 15,
 }
 
 
@@ -450,6 +451,16 @@ class SpirvBuilder:
             cid = self.alloc_id()
             self.const_cache[k] = cid
             self.type_const_globals.extend(encode_inst(OP_CONSTANT, [uty, cid, uval]))
+        return self.const_cache[k]
+
+    def c_s32(self, val: int) -> int:
+        sty = self.t_s32()
+        uval = val & 0xFFFFFFFF
+        k = ("s32", uval)
+        if k not in self.const_cache:
+            cid = self.alloc_id()
+            self.const_cache[k] = cid
+            self.type_const_globals.extend(encode_inst(OP_CONSTANT, [sty, cid, uval]))
         return self.const_cache[k]
 
     def c_f32_bits(self, bits: int) -> int:
@@ -763,6 +774,34 @@ class SpirvBuilder:
                 self.emit_dec(tex_var_id, DEC_BINDING, [32 + fb_slot])
                 self.texture_mask |= (1 << fb_slot)
                 self.entry_flags |= (1 << 5)  # SPIRV_ENTRY_FLAG_FB_FETCH
+                # Detect whether this shader reads RGB channels (not just .a SceneDepth)
+                fb_tainted = {arg_vid}
+                fb_reads_rgb = False
+                fn_vals = self.fn["vals"]
+                for ins in self.fn["insts"]:
+                    iop = ins[0]
+                    if iop == "call":
+                        cname = self.mod.vst.get(ins[3], "")
+                        if cname.startswith("air.convert.f.") and ins[4] and ins[4][0] in fb_tainted:
+                            if ins[1] is not None:
+                                fb_tainted.add(ins[1])
+                        elif any(a in fb_tainted for a in ins[4]):
+                            fb_reads_rgb = True
+                    elif iop == "extractelt" and ins[3] in fb_tainted:
+                        iv = fn_vals[ins[4]]
+                        if iv[1] not in ("int", "null") or int(iv[2] or 0) != 3:
+                            fb_reads_rgb = True
+                    elif iop == "shufflevec" and (ins[3] in fb_tainted or ins[4] in fb_tainted):
+                        mv = fn_vals[ins[5]]
+                        if mv[1] == "data":
+                            if any((int(m) & 3) != 3 for m in mv[2]):
+                                fb_reads_rgb = True
+                        else:
+                            fb_reads_rgb = True
+                    elif any(isinstance(x, int) and x in fb_tainted for x in ins[2:]):
+                        fb_reads_rgb = True
+                if fb_reads_rgb:
+                    self.entry_flags |= (1 << 6)  # SPIRV_ENTRY_FLAG_FB_FETCH_RGB
                 self.bindings_reflection.append(
                     {
                         "set": self.desc_set,
@@ -1508,7 +1547,8 @@ class SpirvBuilder:
                         dst_is_b = self.is_bool_ir_type(dst_ir_ty)
                         if src_is_b and not dst_is_b:
                             n_c = dst_t[1] if dst_t[0] == "vec" else 1
-                            one = self.c_u32(1) if n_c == 1 else self.c_composite(dst_spv_ty, (self.c_u32(1),) * n_c)
+                            t_lit = self.c_u32(0xFFFFFFFF if cast_opc == 2 else 1)
+                            one = t_lit if n_c == 1 else self.c_composite(dst_spv_ty, (t_lit,) * n_c)
                             zero = self.c_u32(0) if n_c == 1 else self.c_null(dst_spv_ty)
                             set_val(cid, emit_op(OP_SELECT, dst_spv_ty, [src_val, one, zero]))
                         elif dst_is_b and not src_is_b:
@@ -1972,25 +2012,32 @@ class SpirvBuilder:
         emit_u32_shr: Any,
         code: list[int],
     ) -> int | None:
-        # 1. Float <-> Half conversions (pass-through since both use OpTypeFloat 32)
-        if name.startswith("air.convert.f.") and ".f." in name[13:]:
-            return get_val(call_args[0])
-
-        # 2. Int <-> Float conversions
+        # 1. Float <-> Half and Int/Bool <-> Float conversions (scalar & vector)
         if name.startswith("air.convert."):
             arg0 = get_val(call_args[0])
-            if ".f.u." in name or ".f16.u." in name or ".f32.u." in name:
-                if name.endswith("i1"):
-                    rt = self.mod.types[ret_ir_ty]
-                    n_c = rt[1] if rt[0] == "vec" else 1
-                    one_f = self.c_f32_bits(0x3F800000)
-                    zero_f = self.c_f32_bits(0)
-                    one = one_f if n_c == 1 else self.c_composite(res_spv_ty, (one_f,) * n_c)
-                    zero = zero_f if n_c == 1 else self.c_null(res_spv_ty)
-                    return emit_op(OP_SELECT, res_spv_ty, [arg0, one, zero])
-                return emit_op(OP_CONVERT_U_TO_F, res_spv_ty, [arg0])
-            if ".f.s." in name or ".f16.s." in name or ".f32.s." in name:
-                return emit_op(OP_CONVERT_S_TO_F, res_spv_ty, [arg0])
+            if name.startswith("air.convert.f.") and len(name) > 13:
+                if ".f." in name[13:]:
+                    return arg0
+                if ".u." in name[13:]:
+                    if name.endswith("i1"):
+                        rt = self.mod.types[ret_ir_ty]
+                        n_c = rt[1] if rt[0] == "vec" else 1
+                        one_f = self.c_f32_bits(0x3F800000)
+                        zero_f = self.c_f32_bits(0)
+                        one = one_f if n_c == 1 else self.c_composite(res_spv_ty, (one_f,) * n_c)
+                        zero = zero_f if n_c == 1 else self.c_null(res_spv_ty)
+                        return emit_op(OP_SELECT, res_spv_ty, [arg0, one, zero])
+                    return emit_op(OP_CONVERT_U_TO_F, res_spv_ty, [arg0])
+                if ".s." in name[13:]:
+                    if name.endswith("i1"):
+                        rt = self.mod.types[ret_ir_ty]
+                        n_c = rt[1] if rt[0] == "vec" else 1
+                        neg_one_f = self.c_f32_bits(0xBF800000)
+                        zero_f = self.c_f32_bits(0)
+                        neg_one = neg_one_f if n_c == 1 else self.c_composite(res_spv_ty, (neg_one_f,) * n_c)
+                        zero = zero_f if n_c == 1 else self.c_null(res_spv_ty)
+                        return emit_op(OP_SELECT, res_spv_ty, [arg0, neg_one, zero])
+                    return emit_op(OP_CONVERT_S_TO_F, res_spv_ty, [arg0])
             if name.startswith("air.convert.u."):
                 return emit_op(OP_CONVERT_F_TO_U, res_spv_ty, [arg0])
             if name.startswith("air.convert.s."):
@@ -2040,33 +2087,130 @@ class SpirvBuilder:
             coord_id = get_val(call_args[2])
             sample_vec_ty = self.t_vec(sampled_ty, 4)
 
+            vals_tbl = self.fn["vals"]
+
+            def _const_bool_true(vid: int) -> bool:
+                vk, vd = vals_tbl[vid][1], vals_tbl[vid][2]
+                return vk == "int" and vd != 0
+
+            def _const_float_is_zero(vid: int) -> bool:
+                vk, vd = vals_tbl[vid][1], vals_tbl[vid][2]
+                if vk == "null":
+                    return True
+                if vk == "float":
+                    return (int(vd) & 0x7FFFFFFF) == 0
+                return False
+
+            def _const_ivec_offset(vid: int, dims: int) -> int | None:
+                vk, vd = vals_tbl[vid][1], vals_tbl[vid][2]
+                if vk == "null":
+                    return None
+                raw_els: list[int] | None = None
+                if vk == "data" and len(vd) >= dims:
+                    raw_els = [int(vd[i]) & 0xFFFFFFFF for i in range(dims)]
+                elif vk == "agg" and len(vd) >= dims:
+                    raw_els = []
+                    for i in range(dims):
+                        sv = vals_tbl[vd[i]]
+                        if sv[1] == "null":
+                            raw_els.append(0)
+                        elif sv[1] == "int":
+                            raw_els.append(int(sv[2]) & 0xFFFFFFFF)
+                        else:
+                            return None
+                if not raw_els or all(x == 0 for x in raw_els):
+                    return None
+                vty = self.t_vec(self.t_s32(), dims)
+                return self.c_composite(vty, tuple(self.c_s32(x) for x in raw_els))
+
             if name.startswith("air.gather_texture_"):
-                comp_id = get_val(call_args[-1])
-                res_v = emit_op(OP_IMAGE_GATHER, sample_vec_ty, [si_id, coord_id, comp_id])
+                # air.gather_texture_2d(tex, smp, coord, i1 is_offset, <2 x i32> offset, i32 comp, i32 flags)
+                comp_vid = call_args[5] if len(call_args) >= 6 else call_args[-1]
+                comp_id = get_val(comp_vid)
+                const_off = None
+                if len(call_args) >= 5 and _const_bool_true(call_args[3]):
+                    const_off = _const_ivec_offset(call_args[4], 2)
+                if const_off is not None:
+                    res_v = emit_op(OP_IMAGE_GATHER, sample_vec_ty, [si_id, coord_id, comp_id, 0x08, const_off])
+                else:
+                    res_v = emit_op(OP_IMAGE_GATHER, sample_vec_ty, [si_id, coord_id, comp_id])
             elif name.startswith("air.sample_texture_2d_grad"):
                 ddx_id = get_val(call_args[3])
                 ddy_id = get_val(call_args[4])
-                # Grad operand = 0x04
-                res_v = emit_op(OP_IMAGE_SAMPLE_EXPLICIT_LOD, sample_vec_ty, [si_id, coord_id, 0x04, ddx_id, ddy_id])
+                const_off = None
+                if len(call_args) >= 7 and _const_bool_true(call_args[5]):
+                    const_off = _const_ivec_offset(call_args[6], 2)
+                # Grad operand = 0x04, ConstOffset = 0x08
+                if const_off is not None:
+                    res_v = emit_op(
+                        OP_IMAGE_SAMPLE_EXPLICIT_LOD,
+                        sample_vec_ty,
+                        [si_id, coord_id, 0x04 | 0x08, ddx_id, ddy_id, const_off],
+                    )
+                else:
+                    res_v = emit_op(
+                        OP_IMAGE_SAMPLE_EXPLICIT_LOD, sample_vec_ty, [si_id, coord_id, 0x04, ddx_id, ddy_id]
+                    )
             elif name.startswith("air.sample_texture_2d_array"):
+                # (tex, smp, coord, arr_idx, i1 is_offset, <2 x i32> offset, i1 is_lod, f32 lod_or_bias, i32 flags)
                 arr_idx_id = get_val(call_args[3])
                 layer_f = emit_op(OP_CONVERT_S_TO_F, self.t_f32(), [arr_idx_id])
                 cx = emit_op(OP_COMPOSITE_EXTRACT, self.t_f32(), [coord_id, 0])
                 cy = emit_op(OP_COMPOSITE_EXTRACT, self.t_f32(), [coord_id, 1])
                 c3_id = emit_op(OP_COMPOSITE_CONSTRUCT, self.t_vec(self.t_f32(), 3), [cx, cy, layer_f])
-                if self.exec_model == 4:
-                    res_v = emit_op(OP_IMAGE_SAMPLE_IMPLICIT_LOD, sample_vec_ty, [si_id, c3_id])
+                const_off = _const_ivec_offset(call_args[5], 2) if (len(call_args) >= 6 and _const_bool_true(call_args[4])) else None
+                use_explicit = (self.exec_model != 4) or (len(call_args) >= 8 and _const_bool_true(call_args[6]))
+                if use_explicit:
+                    lod_f = get_val(call_args[7]) if len(call_args) >= 8 else self.c_f32_bits(0)
+                    if const_off is not None:
+                        res_v = emit_op(OP_IMAGE_SAMPLE_EXPLICIT_LOD, sample_vec_ty, [si_id, c3_id, 0x02 | 0x08, lod_f, const_off])
+                    else:
+                        res_v = emit_op(OP_IMAGE_SAMPLE_EXPLICIT_LOD, sample_vec_ty, [si_id, c3_id, 0x02, lod_f])
                 else:
-                    res_v = emit_op(
-                        OP_IMAGE_SAMPLE_EXPLICIT_LOD, sample_vec_ty, [si_id, c3_id, 0x02, self.c_f32_bits(0)]
-                    )
-            else:
-                # 2D, Cube, 3D sample
-                if self.exec_model == 4:
-                    res_v = emit_op(OP_IMAGE_SAMPLE_IMPLICIT_LOD, sample_vec_ty, [si_id, coord_id])
-                else:
-                    lod_f = get_val(call_args[-2]) if len(call_args) >= 2 else self.c_f32_bits(0)
+                    has_bias = len(call_args) >= 8 and not _const_float_is_zero(call_args[7])
+                    mask = (0x01 if has_bias else 0) | (0x08 if const_off is not None else 0)
+                    ops = [si_id, c3_id]
+                    if mask != 0:
+                        ops.append(mask)
+                        if has_bias:
+                            ops.append(get_val(call_args[7]))
+                        if const_off is not None:
+                            ops.append(const_off)
+                    res_v = emit_op(OP_IMAGE_SAMPLE_IMPLICIT_LOD, sample_vec_ty, ops)
+            elif name.startswith("air.sample_texture_cube"):
+                # (tex, smp, coord, i1 is_explicit_lod, f32 lod_or_bias, i32 flags)
+                use_explicit = (self.exec_model != 4) or (len(call_args) >= 5 and _const_bool_true(call_args[3]))
+                if use_explicit:
+                    lod_f = get_val(call_args[4]) if len(call_args) >= 5 else self.c_f32_bits(0)
                     res_v = emit_op(OP_IMAGE_SAMPLE_EXPLICIT_LOD, sample_vec_ty, [si_id, coord_id, 0x02, lod_f])
+                elif len(call_args) >= 5 and not _const_float_is_zero(call_args[4]):
+                    res_v = emit_op(
+                        OP_IMAGE_SAMPLE_IMPLICIT_LOD, sample_vec_ty, [si_id, coord_id, 0x01, get_val(call_args[4])]
+                    )
+                else:
+                    res_v = emit_op(OP_IMAGE_SAMPLE_IMPLICIT_LOD, sample_vec_ty, [si_id, coord_id])
+            else:
+                # air.sample_texture_2d / 3d: (tex, smp, coord, i1 is_offset, offset, i1 is_explicit_lod, f32 lod_or_bias, i32 flags)
+                off_dims = 3 if "_3d" in name else 2
+                const_off = _const_ivec_offset(call_args[4], off_dims) if (len(call_args) >= 5 and _const_bool_true(call_args[3])) else None
+                use_explicit = (self.exec_model != 4) or (len(call_args) >= 7 and _const_bool_true(call_args[5]))
+                if use_explicit:
+                    lod_f = get_val(call_args[6]) if len(call_args) >= 7 else self.c_f32_bits(0)
+                    if const_off is not None:
+                        res_v = emit_op(OP_IMAGE_SAMPLE_EXPLICIT_LOD, sample_vec_ty, [si_id, coord_id, 0x02 | 0x08, lod_f, const_off])
+                    else:
+                        res_v = emit_op(OP_IMAGE_SAMPLE_EXPLICIT_LOD, sample_vec_ty, [si_id, coord_id, 0x02, lod_f])
+                else:
+                    has_bias = len(call_args) >= 7 and not _const_float_is_zero(call_args[6])
+                    mask = (0x01 if has_bias else 0) | (0x08 if const_off is not None else 0)
+                    ops = [si_id, coord_id]
+                    if mask != 0:
+                        ops.append(mask)
+                        if has_bias:
+                            ops.append(get_val(call_args[6]))
+                        if const_off is not None:
+                            ops.append(const_off)
+                    res_v = emit_op(OP_IMAGE_SAMPLE_IMPLICIT_LOD, sample_vec_ty, ops)
 
             if sample_vec_ty != res_spv_ty:
                 res_v = emit_op(OP_BITCAST, res_spv_ty, [res_v])
