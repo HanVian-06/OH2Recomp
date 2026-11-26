@@ -10,7 +10,7 @@
 
 | Component | Verified Path / Version | Notes |
 |---|---|---|
-| **Android SDK** | `C:\Users\HanVian\AppData\Local\Android\Sdk` | `platform-tools` (`adb` 37.0.1), `build-tools 36.0.0`, `platforms/android-36.1` & `android-37.0` |
+| **Android SDK** | `%LOCALAPPDATA%\Android\Sdk` | `platform-tools` (`adb` 37.0.1), `build-tools 36.0.0`, `platforms/android-36.1` & `android-37.0` |
 | **Android NDK** | `28.2.13676358` (`r28c`) | `clang 19.0.1` (`aarch64-linux-android29-clang++.cmd`), `llvm-readelf`, `llvm-objdump`, `ld.lld` |
 | **CMake & Ninja** | CMake `3.22.1-g37088a8-dirty`, Ninja `1.10.2` | `...\Android\Sdk\cmake\3.22.1\bin` (prepended by `scripts/env.ps1`) |
 | **Vulkan SDK** | `C:\VulkanSDK\1.4.350.0` | `spirv-val` (`v2026.2`), `glslc` (`shaderc v2026.2`), `spirv-cross` (`1.4.341.0-67`) |

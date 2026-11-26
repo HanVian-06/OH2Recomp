@@ -1,14 +1,19 @@
-# Read-only original iOS IPA payload & extracted game binaries (copyrighted — NEVER commit)
+# =============================================================================
+# Copyrighted Game Data & Extracted Assets — NEVER COMMIT
+# =============================================================================
 Payload/
 *.ipa
 *.pak
+*.ushaderbytecode
 *.mtlb
 *.metallib
 oh2_macho.bin
 spirv_cache.bin
 vk_pipeline_cache.bin
 
-# Build, CMake & Gradle outputs
+# =============================================================================
+# Build, CMake, Ninja, Gradle & Android Packaging Outputs
+# =============================================================================
 build/
 build_*/
 dist/
@@ -17,9 +22,12 @@ out/
 .cxx/
 android/**/build/
 android/**/.cxx/
-android/**/assets/shaders/
+android/**/assets/
 CMakeCache.txt
 CMakeFiles/
+cmake_install.cmake
+Makefile
+build.ninja
 .ninja_deps
 .ninja_log
 *.apk
@@ -29,20 +37,27 @@ CMakeFiles/
 *.ap_
 *.dex
 *.spv
+*.o
+*.obj
 *.dSYM/
 
-# Keystores, signing secrets & local env
+# =============================================================================
+# Keystores, Signing Secrets, Tokens & Local Environment Overrides
+# =============================================================================
 *.keystore
 *.jks
 *.pem
 *.p12
+*.key
 *.token
 .env
 .env.*
 scripts/env.local.ps1
 local.properties
 
-# Python & IDE
+# =============================================================================
+# Python, IDE & OS Metadata
+# =============================================================================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -51,24 +66,31 @@ __pycache__/
 venv/
 .idea/
 .vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
 
-# Temp, logs & local captures
+# =============================================================================
+# Temporary Files, Logs, Crash Dumps & Local Media Captures
+# =============================================================================
 *.tmp
 *.temp
 *.log
+*.dmp
+*.tombstone*
 *.mp4
 /*.png
 /*.jpg
 /*.jpeg
 scratch/
-.DS_Store
-Thumbs.db
 
-# Local scratch/e2e test harness
+# =============================================================================
+# Local Scratch / E2E Test Harness & Raw Third-Party Archives
+# =============================================================================
 scripts/e2e/
 scripts/run_e2e.ps1
 tests/
-
-# Downloaded archives (keep extracted verified libs if committed, ignore raw zips/aars)
 third_party/**/*.zip
 third_party/**/*.aar

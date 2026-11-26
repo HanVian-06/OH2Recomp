@@ -198,8 +198,17 @@ def main() -> int:
     failures = 0
     checks: list[tuple[str, bool, str]] = []
 
-    ok_crypt, msg_crypt = check_macho_cryptid(OH2_BINARY)
-    checks.append(("Mach-O FairPlay cryptid == 0", ok_crypt, msg_crypt))
+    if os.path.isfile(OH2_BINARY):
+        ok_crypt, msg_crypt = check_macho_cryptid(OH2_BINARY)
+        checks.append(("Mach-O FairPlay cryptid == 0", ok_crypt, msg_crypt))
+    elif "--require-payload" in sys.argv:
+        checks.append(("Mach-O FairPlay cryptid == 0", False, f"Binary not found: {OH2_BINARY}"))
+    else:
+        checks.append((
+            "Mach-O FairPlay cryptid == 0",
+            True,
+            "Clean open-source checkout (Payload/OH2.app/OH2 not present; pass --require-payload to enforce)",
+        ))
 
     checks.extend(check_docs())
 
